@@ -1,0 +1,93 @@
+import torch
+
+
+class BatteryPhysicsLoss:
+    """
+    只包含：
+    - LAM（容量单调下降）
+    - plating（高SOC + 高电流 + 低温 风险约束）
+    """
+
+    def __init__(self, eps=1e-6):
+        self.eps = eps
+
+    # =========================
+    # LAM: 容量单调下降（全局）
+    # =========================
+    def lam_loss(self, capacity):
+        """
+        capacity: [B, T]
+        要求：Q(t) 不上升
+        """
+        diff = capacity[:, 1:] - capacity[:, :-1]
+
+        # 惩罚“上升”
+        loss = torch.mean(torch.relu(diff))
+
+        return loss
+
+    # =========================
+    # SOC proxy（用电压）
+    # =========================
+    def compute_soc(self, voltage):
+        """
+        用电压归一化近似 SOC
+        """
+        v_min = voltage.min(dim=1, keepdim=True)[0]
+        v_max = voltage.max(dim=1, keepdim=True)[0]
+
+        soc = (voltage - v_min) / (v_max - v_min + self.eps)
+        return soc
+
+    # =========================
+    # plating: 局部风险约束
+    # =========================
+    def plating_loss(self, voltage, current, temperature):
+        """
+        高 SOC + 高电流 + 低温 → 惩罚
+        """
+
+        # ===== SOC =====
+        soc = self.compute_soc(voltage)
+
+        # ===== 自适应阈值（每个 batch）=====
+        soc_th = torch.quantile(soc, 0.8, dim=1, keepdim=True)
+        curr_th = torch.quantile(current, 0.8, dim=1, keepdim=True)
+        temp_th = torch.quantile(temperature, 0.2, dim=1, keepdim=True)  # 低温
+
+        # ===== soft gating =====
+        soc_risk = torch.sigmoid((soc - soc_th) * 10)
+        curr_risk = torch.sigmoid((current - curr_th) * 10)
+        temp_risk = torch.sigmoid((temp_th - temperature) * 10)
+
+        # ===== 只在充电阶段生效 =====
+        charge_mask = (current > 0).float()
+
+        risk = soc_risk * curr_risk * temp_risk * charge_mask
+
+        # ===== 惩罚项 =====
+        loss = torch.mean(risk * (current ** 2))
+
+        return loss
+
+    # =========================
+    # total physics loss
+    # =========================
+    def __call__(self, batch):
+        """
+        batch 需要：
+        - capacity: [B, T]
+        - voltage: [B, T]
+        - current: [B, T]
+        - temperature: [B, T]
+        """
+
+        capacity = batch["capacity"]
+        voltage = batch["voltage"]
+        current = batch["current"]
+        temperature = batch["temperature"]
+
+        lam = self.lam_loss(capacity)
+        plating = self.plating_loss(voltage, current, temperature)
+
+        return lam, plating
