@@ -1,94 +1,76 @@
 import torch
 import argparse
 
-from task_router import TaskRouter
-from SOH import train_soh
+from task_router import TaskRouter, LocalQwenClassifier
+from SOH import run_soh
 
 
 def main():
 
     parser = argparse.ArgumentParser()
 
+    # =========================
+    # system-level（必须保留）
+    # =========================
     parser.add_argument("--task_text", type=str, default="")
     parser.add_argument("--device", default="cuda")
 
-    parser.add_argument("--use_llm_router", action="store_true")
-    parser.add_argument("--qwen_model_path", type=str, default="")
+    parser.add_argument(
+        "--llm_router_path",
+        type=str,
+        default=r"D:\Code_LTF\model_fine_turing\large_model\qwen\Qwen3-1.7B"
+    )
 
-    # training config
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch_size", type=int, default=64)
-
-    # model config
-    parser.add_argument("--fusion", default="crossattn")
-    parser.add_argument("--use_prompt", action="store_true")
-
-    parser.add_argument("--cross_d_model", type=int, default=256)
-    parser.add_argument("--cross_nhead", type=int, default=4)
-
-    parser.add_argument("--early_stop", type=int, default=10)
+    # =========================
+    # runtime control（非任务相关）
+    # =========================
+    parser.add_argument("--seed", type=int, default=2023)
 
     args = parser.parse_args()
 
     # =========================
-    # 1. 用户输入（自然语言）
+    # input
     # =========================
     if not args.task_text:
-        print("请输入电池分析任务（自然语言描述）：")
+        print("请输入电池分析任务：")
         args.task_text = input(">>> ").strip()
 
     # =========================
-    # 2. Router（任务识别）
+    # router
     # =========================
-    router = TaskRouter()
+    llm = LocalQwenClassifier(args.llm_router_path, device=args.device)
+    router = TaskRouter(llm=llm)
 
-    task = router.route(
-        args.task_text,
-        use_llm=args.use_llm_router
-    )
+    task = router.route(args.task_text)
 
     print("\n========================")
-    print(f"[Router] → {task.label} ({task.method})")
+    print(f"[Router] → {task.label}")
     print("========================\n")
 
-    # =========================
-    # 3. Agent dispatch（核心）
-    # =========================
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # =========================
+    # task dispatch
+    # =========================
     if task.label == "SOH":
-        from MIT_loader import MITDdataset
-        from XJTU_loader import XJTUDdataset
-        from prompts import build_dataloaders
+        run_soh(args, device)
 
-        def get_data(args):
-            if args.data == "MIT":
-                loader = MITDdataset(args)
-            else:
-                loader = XJTUDdataset(args)
+    elif task.label in ["FD", "AD"]:
+        print(f"⚠️ 已识别任务：{task.label}")
+        print("但当前系统暂未实现该模块（仅 SOH 可用）")
 
-            return loader.get_partial_data(test_battery_id=2)
-
-        data_dict = get_data(args)
-        train_loader, val_loader, test_loader = build_dataloaders(args, data_dict)
-
-        train_soh(
-            args,
-            train_loader,
-            val_loader,
-            test_loader,
-            device
-        )
-
-    elif task.label == "FD":
-        print("FD Agent not implemented yet")
-
-    elif task.label == "AD":
-        print("AD Agent not implemented yet")
+        print("\n👉 请尝试：")
+        print("- 电池容量为什么下降这么快？")
+        print("- 是否存在故障？")
+        print("- 是否出现异常波动？")
 
     else:
-        print("Unknown task")
+        print("⚠️ 未识别为电池任务（UNKNOWN）")
+
+        print("\n👉 请提问电池相关问题，例如：")
+        print("- 电池容量为什么下降这么快？")
+        print("- 电池是否存在故障？")
+        print("- 是否检测到异常波动？")
 
 
 if __name__ == "__main__":
