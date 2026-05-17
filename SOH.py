@@ -1,154 +1,350 @@
-import os
-import time
 import torch
 from torch import nn, optim
 
-from models import LSTMEncoder, TSOnlyModel, SemanticTSModel, AttnThenLLMModel
-from train_utils import train_one_epoch, evaluate, ensure_dir, save_best, load_best
+from types import SimpleNamespace
+
+from MIT_loader import MITDdataset
+
+from models import (
+    LSTMEncoder,
+    TSLLMModel
+)
+
+from train_utils import evaluate
+from prompts import build_dataloaders
 
 
-def train_soh(args, train_loader, val_loader, test_loader, device):
+# =========================================================
+# CONFIG
+# =========================================================
+SOH_CONFIG = {
 
-    # ======================
-    # 1. encoder
-    # ======================
-    ts_encoder = LSTMEncoder(input_dim=4, hidden_dim=128).to(device)
+    # =====================================================
+    # data
+    # =====================================================
+    "data": "MIT",
 
-    fusion = args.fusion
+    "input_type": "partial_charge",
 
-    # ======================
-    # 2. model
-    # ======================
-    if not args.use_prompt:
-        model = TSOnlyModel(
-            ts_encoder=ts_encoder,
-            ts_dim=128,
-            dropout=args.dropout
-        ).to(device)
-        mode = "TSonly"
+    "batch": 2,
+
+    "batch_size": 4,
+
+    "normalized_type": "minmax",
+
+    "minmax_range": (0, 1),
+
+    # =====================================================
+    # LLM
+    # =====================================================
+    "llm_path": r"D:\Code_LTF\model_fine_turing\large_model\qwen\Qwen3-4B",
+
+    # =====================================================
+    # training
+    # =====================================================
+    "epochs": 100,
+
+    "lr": 1e-4,
+
+    "weight_decay": 1e-4,
+
+    "dropout": 0.1,
+    "use_prompt": False,
+    # =====================================================
+    # misc
+    # =====================================================
+    "random_seed": 2023,
+
+    "seed": 2023,
+
+    "test_battery_id": 1,
+}
+
+
+# =========================================================
+# RUNNER
+# =========================================================
+def run_soh(args, device):
+
+    cfg = SimpleNamespace(**SOH_CONFIG)
+
+    cfg.device = device
+
+    # =====================================================
+    # dataset
+    # =====================================================
+    loader = MITDdataset(cfg)
+
+    if cfg.input_type == "charge":
+
+        data_dict = loader.get_charge_data(
+            test_battery_id=cfg.test_battery_id
+        )
+
+    elif cfg.input_type == "partial_charge":
+
+        data_dict = loader.get_partial_data(
+            test_battery_id=cfg.test_battery_id
+        )
 
     else:
-        if fusion == "film":
-            _, _, p0 = next(iter(train_loader))
-            prompt_dim = p0.shape[-1]
 
-            model = SemanticTSModel(
-                ts_encoder=ts_encoder,
-                ts_dim=128,
-                prompt_dim=prompt_dim,
-                film_hidden=256,
-                dropout=args.dropout
-            ).to(device)
+        data_dict = loader.get_features(
+            test_battery_id=cfg.test_battery_id
+        )
 
-            mode = "FiLM"
+    # =====================================================
+    # dataloader
+    # =====================================================
+    train_loader, val_loader, test_loader = build_dataloaders(
+        cfg,
+        data_dict
+    )
 
-        elif fusion == "crossattn":
-            _, _, pt0, _ = next(iter(train_loader))
-            prompt_dim = pt0.shape[-1]
 
-            model = AttnThenLLMModel(
-                ts_encoder=ts_encoder,
-                ts_dim=128,
-                prompt_dim=prompt_dim,
-                d_model=args.cross_d_model,
-                nhead=args.cross_nhead,
-                dropout=args.dropout,
-                use_llm_feature=args.use_llm_feature,
-                llm_path=args.llm_path,
-                device=args.device
-            ).to(device)
 
-            mode = "CrossAttn"
+    # =====================================================
+    # TS encoder
+    # =====================================================
+    ts_encoder = LSTMEncoder(
+        input_dim=4,
+        hidden_dim=128
+    ).to(device)
 
-        else:
-            raise ValueError("fusion error")
+    # =====================================================
+    # model
+    # =====================================================
+    model = TSLLMModel(
 
-    # ======================
-    # 3. loss / opt
-    # ======================
+        ts_encoder=ts_encoder,
+
+        ts_dim=128,
+
+        llm_path=cfg.llm_path,
+
+        dropout=cfg.dropout,
+
+        device=device,
+
+        llm_dtype="bf16"
+
+    ).to(device)
+
+    print("\n[Model] TSLLMModel")
+
+    # =====================================================
+    # optimizer
+    # =====================================================
+    optimizer = optim.Adam(
+
+        model.parameters(),
+
+        lr=cfg.lr,
+
+        weight_decay=cfg.weight_decay
+    )
+
+    # =====================================================
+    # scheduler
+    # =====================================================
+    scheduler = optim.lr_scheduler.MultiStepLR(
+
+        optimizer,
+
+        milestones=[30, 70],
+
+        gamma=0.5
+    )
+
+    # =====================================================
+    # loss
+    # =====================================================
     loss_fn = nn.MSELoss()
 
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay
-    )
+    # =====================================================
+    # training initialize
+    # =====================================================
+    best_val = 1e9
 
-    scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=args.milestones,
-        gamma=args.gamma
-    )
+    best_metrics = None
 
-    # ======================
-    # 4. save path
-    # ======================
-    ensure_dir(args.save_dir)
+    best_epoch = 0
 
-    best_path = os.path.join(args.save_dir, f"best_soh_{mode}.pt")
+    best_state = None
 
-    best_val = float("inf")
-    stop = 0
+    train_loss_history = []
 
-    # ======================
-    # 5. training loop
-    # ======================
-    for epoch in range(args.epochs):
+    val_loss_history = []
 
-        train_loss = train_one_epoch(
-            model, device, train_loader, optimizer,
-            loss_fn=loss_fn,
-            fusion=fusion,
-            use_prompt=args.use_prompt
-        )
+    # =====================================================
+    # training start
+    # =====================================================
+    print("\n========================")
+    print("Start Training")
+    print("========================")
 
-        scheduler.step()
+    for epoch in range(cfg.epochs):
 
-        val_loss, val_metrics = evaluate(
-            model, device, val_loader,
-            loss_fn=loss_fn,
-            fusion=fusion,
-            use_prompt=args.use_prompt
-        )
+        # =================================================
+        # train
+        # =================================================
+        model.train()
 
-        improved = val_loss < best_val
+        train_loss_sum = 0.0
 
-        print(f"[SOH-{mode}] epoch {epoch} "
-              f"train={train_loss:.4f} val={val_loss:.4f} "
-              f"RMSE={val_metrics['RMSE']:.4f}")
+        for batch in train_loader:
 
-        if improved:
-            best_val = val_loss
-            stop = 0
-            save_best(best_path, model, optimizer, epoch, best_val)
+            # =============================================
+            # batch
+            # =============================================
+            ts_x, y = batch
 
-            test_loss, test_metrics = evaluate(
-                model, device, test_loader,
-                loss_fn=loss_fn,
-                fusion=fusion,
-                use_prompt=args.use_prompt
+            ts_x = ts_x.to(device)
+
+            y = y.to(device)
+
+            # =============================================
+            # forward
+            # =============================================
+            pred = model(ts_x)
+
+            pred = pred.view_as(y)
+
+            # =============================================
+            # loss
+            # =============================================
+            loss = loss_fn(pred, y)
+
+            # =============================================
+            # backward
+            # =============================================
+            optimizer.zero_grad()
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0
             )
 
-            print(f"   → TEST RMSE={test_metrics['RMSE']:.4f}")
+            optimizer.step()
 
-        else:
-            stop += 1
+            train_loss_sum += loss.item()
 
-        if stop > args.early_stop:
-            print("Early stop")
-            break
+        # =================================================
+        # scheduler
+        # =================================================
+        scheduler.step()
 
-    # ======================
-    # 6. final eval
-    # ======================
-    load_best(best_path, model, device)
+        # =================================================
+        # train loss
+        # =================================================
+        train_loss = train_loss_sum / len(train_loader)
 
-    final_test = evaluate(
-        model, device, test_loader,
-        loss_fn=loss_fn,
-        fusion=fusion,
-        use_prompt=args.use_prompt
+        train_loss_history.append(train_loss)
+
+        # =================================================
+        # validation
+        # =================================================
+        val_loss, metrics = evaluate(
+
+            model=model,
+
+            device=device,
+
+            loader=val_loader,
+
+            loss_fn=loss_fn
+        )
+
+        val_loss_history.append(val_loss)
+
+        lr = optimizer.state_dict()['param_groups'][0]['lr']
+
+        # =================================================
+        # logging
+        # =================================================
+        print(
+            f"[SOH] "
+            f"epoch=[{epoch + 1}/{cfg.epochs}] "
+            f"train_loss={train_loss:.6f} "
+            f"val_loss={val_loss:.6f} "
+            f"lr={lr:.6f}"
+        )
+
+        # =================================================
+        # best model
+        # =================================================
+        if val_loss < best_val:
+
+            best_val = val_loss
+
+            best_epoch = epoch + 1
+
+            best_metrics = metrics
+
+            best_state = {
+                "model": model.state_dict()
+            }
+
+            print(
+                f"[Best] "
+                f"epoch={best_epoch} "
+                f"val_loss={best_val:.6f}"
+            )
+
+            print(
+                f"        "
+                f"MAE={metrics['MAE']:.4f} | "
+                f"MAPE={metrics['MAPE']:.2f}% | "
+                f"RMSE={metrics['RMSE']:.4f} | "
+                f"R2={metrics['R2']:.4f}"
+            )
+
+    # =====================================================
+    # load best model
+    # =====================================================
+    print("\n========================")
+    print("Load Best Model")
+    print("========================")
+
+    model.load_state_dict(
+        best_state["model"]
     )
 
-    print("\n===== FINAL =====")
-    print(f"TEST RMSE: {final_test[1]['RMSE']:.4f}")
+    print(
+        f"Best epoch = {best_epoch} | "
+        f"Best val_loss = {best_val:.6f}"
+    )
+
+    # =====================================================
+    # final test
+    # =====================================================
+    print("\n========================")
+    print("FINAL TEST RESULT")
+    print("========================")
+
+    test_loss, metrics = evaluate(
+
+        model=model,
+
+        device=device,
+
+        loader=test_loader,
+
+        loss_fn=loss_fn
+    )
+
+    print(f"test_loss = {test_loss:.6f}")
+
+    print(f"MAE  = {metrics['MAE']:.4f}")
+
+    print(f"MAPE = {metrics['MAPE']:.2f}%")
+
+    print(f"RMSE = {metrics['RMSE']:.4f}")
+
+    print(f"R2   = {metrics['R2']:.4f}")
+
+    print("\n========================")
+    print("Training Finished")
+    print("========================")
