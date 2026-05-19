@@ -1,3 +1,9 @@
+
+# =========================================================
+# SOH.py
+# TS -> LoRA-Qwen -> SOH
+# =========================================================
+
 import torch
 from torch import nn, optim
 
@@ -24,7 +30,7 @@ SOH_CONFIG = {
     # =====================================================
     "data": "MIT",
 
-    "input_type": "partial_charge",
+    "input_type": "handcraft_features",
 
     "batch": 2,
 
@@ -38,11 +44,13 @@ SOH_CONFIG = {
     # LLM
     # =====================================================
     "llm_path": r"D:\Code_LTF\model_fine_turing\large_model\qwen\Qwen3-4B",
+    
+    
 
     # =====================================================
     # training
     # =====================================================
-    "epochs": 100,
+    "epochs": 50,
 
     "lr": 1e-4,
 
@@ -53,11 +61,11 @@ SOH_CONFIG = {
     # =====================================================
     # misc
     # =====================================================
-    "random_seed": 2023,
+    "random_seed": 2026,
 
     "seed": 2023,
 
-    "test_battery_id": 1,
+    "test_battery_id": 2,
 }
 
 
@@ -101,6 +109,24 @@ def run_soh(args, device):
         data_dict
     )
 
+    # preprocess
+    # =====================================================
+    if cfg.input_type == "handcraft_features":
+
+        preprocess = nn.Sequential(
+
+            nn.Flatten(),
+
+            nn.Linear(67, 4 * 128),
+
+            nn.GELU(),
+
+            nn.Unflatten(1, (4, 128))
+        ).to(device)
+
+    else:
+
+        preprocess = nn.Identity().to(device)
 
 
     # =====================================================
@@ -137,23 +163,12 @@ def run_soh(args, device):
     # =====================================================
     optimizer = optim.Adam(
 
-        model.parameters(),
+        list(model.parameters()) +
+        list(preprocess.parameters()),
 
         lr=cfg.lr,
 
         weight_decay=cfg.weight_decay
-    )
-
-    # =====================================================
-    # scheduler
-    # =====================================================
-    scheduler = optim.lr_scheduler.MultiStepLR(
-
-        optimizer,
-
-        milestones=[30, 70],
-
-        gamma=0.5
     )
 
     # =====================================================
@@ -193,7 +208,6 @@ def run_soh(args, device):
         train_loss_sum = 0.0
 
         for batch in train_loader:
-
             # =============================================
             # batch
             # =============================================
@@ -201,11 +215,17 @@ def run_soh(args, device):
 
             ts_x = ts_x.to(device)
 
+
             y = y.to(device)
+
+            # =============================================
+            # preprocess
+            # (B,1,20) -> (B,4,128)
 
             # =============================================
             # forward
             # =============================================
+            ts_x = preprocess(ts_x)
             pred = model(ts_x)
 
             pred = pred.view_as(y)
@@ -231,10 +251,6 @@ def run_soh(args, device):
 
             train_loss_sum += loss.item()
 
-        # =================================================
-        # scheduler
-        # =================================================
-        scheduler.step()
 
         # =================================================
         # train loss
@@ -249,6 +265,8 @@ def run_soh(args, device):
         val_loss, metrics = evaluate(
 
             model=model,
+
+            preprocess=preprocess,
 
             device=device,
 
@@ -327,6 +345,8 @@ def run_soh(args, device):
     test_loss, metrics = evaluate(
 
         model=model,
+
+        preprocess=preprocess,
 
         device=device,
 
