@@ -43,7 +43,6 @@ class LSTMEncoder(nn.Module):
 
         out, _ = self.rnn(x)
 
-        # (B,T,H)
         return out
 
 
@@ -61,17 +60,11 @@ class LLMTokenEncoder(nn.Module):
     ):
         super().__init__()
 
-        # =====================================================
-        # tokenizer
-        # =====================================================
         self.tokenizer = AutoTokenizer.from_pretrained(
             llm_path,
             use_fast=True
         )
 
-        # =====================================================
-        # soft prompt
-        # =====================================================
         self.text_prompt = (
             "You are a battery SOH prediction model."
         )
@@ -101,14 +94,13 @@ class LLMTokenEncoder(nn.Module):
             dtype = torch.float32
 
         # =====================================================
-        # load qwen
+        # load llm
         # =====================================================
         llm = AutoModelForCausalLM.from_pretrained(
             llm_path,
             torch_dtype=dtype,
             device_map="auto" if str(device).startswith("cuda")
-
- else None
+            else None
         )
 
         # =====================================================
@@ -143,9 +135,6 @@ class LLMTokenEncoder(nn.Module):
 
         llm.print_trainable_parameters()
 
-        # =====================================================
-        # base model
-        # =====================================================
         self.base = getattr(llm, "model", llm)
 
         self.hidden_size = llm.config.hidden_size
@@ -204,7 +193,7 @@ class LLMTokenEncoder(nn.Module):
         P = prompt_emb.size(1)
 
         # =====================================================
-        # mask
+        # attention mask
         # =====================================================
         if attention_mask is None:
 
@@ -245,19 +234,25 @@ class LLMTokenEncoder(nn.Module):
         emb = emb.to(dtype=llm_dtype)
 
         out = self.base(
+
             inputs_embeds=emb,
+
             attention_mask=attn_mask,
+
             position_ids=position_ids,
+
             use_cache=False,
+
             output_hidden_states=True
         )
 
         h = out.hidden_states[-1][:, P:, :]
+
         return h
 
 
 # =========================================================
-# 3) TS + LoRA-Qwen + AttentionPooling
+# 3) TSLLMModel
 # =========================================================
 class TSLLMModel(nn.Module):
 
@@ -272,13 +267,10 @@ class TSLLMModel(nn.Module):
     ):
         super().__init__()
 
-        # =====================================================
-        # TS encoder
-        # =====================================================
         self.ts_encoder = ts_encoder
 
         # =====================================================
-        # pre-llm projection
+        # pre llm projection
         # =====================================================
         self.pre_llm_proj = nn.Sequential(
 
@@ -290,12 +282,16 @@ class TSLLMModel(nn.Module):
         )
 
         # =====================================================
-        # LLM encoder
+        # llm encoder
         # =====================================================
         self.llm_enc = LLMTokenEncoder(
+
             llm_path=llm_path,
+
             in_dim=ts_dim,
+
             device=device,
+
             llm_dtype=llm_dtype
         )
 
@@ -331,16 +327,19 @@ class TSLLMModel(nn.Module):
 
         self.head = self.head.float()
 
-    def forward(self, ts_x):
+    def forward(
+            self,
+            ts_x,
+            return_latent=False
+    ):
 
         # =====================================================
         # 1) LSTM
         # =====================================================
         ts_tokens = self.ts_encoder(ts_x)
-        # (B,T,H)
 
         # =====================================================
-        # 2) Projection
+        # 2) pre-llm projection
         # =====================================================
         ts_tokens = self.pre_llm_proj(ts_tokens)
 
@@ -362,7 +361,7 @@ class TSLLMModel(nn.Module):
         )
 
         # =====================================================
-        # 4) Attention Pooling
+        # 4) attention pooling
         # =====================================================
         h = h.to(
             dtype=next(
@@ -382,7 +381,7 @@ class TSLLMModel(nn.Module):
         ).sum(dim=1)
 
         # =====================================================
-        # 5) Regression
+        # 5) regression
         # =====================================================
         pooled = pooled.to(
             dtype=next(
@@ -394,4 +393,52 @@ class TSLLMModel(nn.Module):
             pooled
         ).squeeze(-1)
 
+        if return_latent:
+            return yhat, pooled
+
         return yhat
+
+
+# =========================================================
+# 4) PhysicsNet
+# dSOH/dN = F(h,SOH,N)
+# =========================================================
+class PhysicsNet(nn.Module):
+
+    def __init__(
+            self,
+            latent_dim
+    ):
+        super().__init__()
+
+        in_dim = latent_dim + 2
+
+        self.net = nn.Sequential(
+
+            nn.LayerNorm(in_dim),
+
+            nn.Linear(in_dim, latent_dim),
+
+            nn.GELU(),
+
+            nn.Linear(latent_dim, latent_dim // 2),
+
+            nn.GELU(),
+
+            nn.Linear(latent_dim // 2, 1)
+        )
+
+    def forward(
+            self,
+            h,
+            soh,
+            cycle
+    ):
+
+        x = torch.cat([
+            h,
+            soh,
+            cycle
+        ], dim=-1)
+
+        return self.net(x)
