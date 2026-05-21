@@ -1,397 +1,54 @@
+import numpy as np
 import torch
-from torch import nn
-
-from transformers import AutoModelForCausalLM
-from transformers import AutoTokenizer
-
-from peft import LoraConfig
-from peft import get_peft_model
-
-
-# =========================================================
-# 1) LSTM Encoder
-# =========================================================
-class LSTMEncoder(nn.Module):
-
-    def __init__(
-            self,
-            input_dim=4,
-            hidden_dim=128,
-            num_layers=1,
-            dropout=0.0
-    ):
-        super().__init__()
-
-        self.rnn = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=False
-        )
-
-    def forward(self, x):
-
-        # (B,C,T) -> (B,T,C)
-        if x.dim() == 3:
-
-            if x.size(-1) != self.rnn.input_size \
-                    and x.size(1) == self.rnn.input_size:
-
-                x = x.transpose(1, 2).contiguous()
-
-        out, _ = self.rnn(x)
-
-        # (B,T,H)
-        return out
-
-
-# =========================================================
-# 2) LLM Token Encoder + LoRA
-# =========================================================
-class LLMTokenEncoder(nn.Module):
-
-    def __init__(
-            self,
-            llm_path,
-            in_dim,
-            device="cuda",
-            llm_dtype="bf16"
-    ):
-        super().__init__()
-
-        # =====================================================
-        # tokenizer
-        # =====================================================
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            llm_path,
-            use_fast=True
-        )
-
-        # =====================================================
-        # soft prompt
-        # =====================================================
-        self.text_prompt = (
-            "You are a battery SOH prediction model."
-        )
-
-        prompt_ids = self.tokenizer(
-            self.text_prompt,
-            return_tensors="pt",
-            add_special_tokens=False
-        ).input_ids
-
-        self.register_buffer(
-            "prompt_ids",
-            prompt_ids,
-            persistent=False
-        )
-
-        # =====================================================
-        # dtype
-        # =====================================================
-        if llm_dtype.lower() == "bf16":
-            dtype = torch.bfloat16
-
-        elif llm_dtype.lower() == "fp16":
-            dtype = torch.float16
-
-        else:
-            dtype = torch.float32
-
-        # =====================================================
-        # load qwen
-        # =====================================================
-        llm = AutoModelForCausalLM.from_pretrained(
-            llm_path,
-            torch_dtype=dtype,
-            device_map="auto" if str(device).startswith("cuda")
-
- else None
-        )
-
-        # =====================================================
-        # LoRA
-        # =====================================================
-        lora_config = LoraConfig(
-
-            r=8,
-
-            lora_alpha=16,
-
-            target_modules=[
-                "q_proj",
-                "v_proj"
-            ],
-
-            lora_dropout=0.1,
-
-            bias="none",
-
-            task_type="CAUSAL_LM"
-        )
-
-        llm = get_peft_model(
-            llm,
-            lora_config
-        )
-
-        print("\n========================")
-        print("LoRA Enabled")
-        print("========================")
-
-        llm.print_trainable_parameters()
-
-        # =====================================================
-        # base model
-        # =====================================================
-        self.base = getattr(llm, "model", llm)
-
-        self.hidden_size = llm.config.hidden_size
-
-        # =====================================================
-        # projection
-        # =====================================================
-        self.proj = nn.Linear(
-            in_dim,
-            self.hidden_size
-        )
-
-        self.proj = self.proj.to(
-            dtype=next(self.base.parameters()).dtype
-        )
-
-    def forward(
-            self,
-            x_tokens,
-            attention_mask=None
-    ):
-
-        proj_dtype = self.proj.weight.dtype
-        proj_device = self.proj.weight.device
-
-        x_tokens = x_tokens.to(
-            device=proj_device,
-            dtype=proj_dtype
-        )
-
-        # =====================================================
-        # projection
-        # =====================================================
-        x_emb = self.proj(x_tokens)
-
-        # =====================================================
-        # prompt embedding
-        # =====================================================
-        p_ids = self.prompt_ids.to(
-            device=proj_device
-        ).expand(x_emb.size(0), -1)
-
-        tok_emb_layer = self.base.get_input_embeddings()
-
-        prompt_emb = tok_emb_layer(p_ids)
-
-        # =====================================================
-        # concat
-        # =====================================================
-        emb = torch.cat([
-            prompt_emb.to(x_emb.dtype),
-            x_emb
-        ], dim=1)
-
-        B, T, _ = x_emb.shape
-        P = prompt_emb.size(1)
-
-        # =====================================================
-        # mask
-        # =====================================================
-        if attention_mask is None:
-
-            attention_mask = torch.ones(
-                B,
-                T,
-                device=proj_device,
-                dtype=torch.long
-            )
-
-        prefix_mask = torch.ones(
-            B,
-            P,
-            device=proj_device,
-            dtype=torch.long
-        )
-
-        attn_mask = torch.cat([
-            prefix_mask,
-            attention_mask
-        ], dim=1)
-
-        # =====================================================
-        # position ids
-        # =====================================================
-        position_ids = torch.arange(
-            P + T,
-            device=proj_device
-        ).unsqueeze(0).expand(B, P + T)
-
-        # =====================================================
-        # llm forward
-        # =====================================================
-        llm_dtype = next(
-            self.base.parameters()
-        ).dtype
-
-        emb = emb.to(dtype=llm_dtype)
-
-        out = self.base(
-            inputs_embeds=emb,
-            attention_mask=attn_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            output_hidden_states=True
-        )
-
-        h = out.hidden_states[-1][:, P:, :]
-        return h
-
-
-# =========================================================
-# 3) TS + LoRA-Qwen + AttentionPooling
-# =========================================================
-class TSLLMModel(nn.Module):
-
-    def __init__(
-            self,
-            ts_encoder,
-            ts_dim=128,
-            llm_path="",
-            dropout=0.1,
-            device="cuda",
-            llm_dtype="bf16"
-    ):
-        super().__init__()
-
-        # =====================================================
-        # TS encoder
-        # =====================================================
-        self.ts_encoder = ts_encoder
-
-        # =====================================================
-        # pre-llm projection
-        # =====================================================
-        self.pre_llm_proj = nn.Sequential(
-
-            nn.Linear(ts_dim, ts_dim),
-
-            nn.GELU(),
-
-            nn.LayerNorm(ts_dim)
-        )
-
-        # =====================================================
-        # LLM encoder
-        # =====================================================
-        self.llm_enc = LLMTokenEncoder(
-            llm_path=llm_path,
-            in_dim=ts_dim,
-            device=device,
-            llm_dtype=llm_dtype
-        )
-
-        out_dim = self.llm_enc.hidden_size
-
-        # =====================================================
-        # attention pooling
-        # =====================================================
-        self.pool_attn = nn.Sequential(
-
-            nn.Linear(out_dim, out_dim // 2),
-
-            nn.Tanh(),
-
-            nn.Linear(out_dim // 2, 1)
-        )
-
-        # =====================================================
-        # regression head
-        # =====================================================
-        self.head = nn.Sequential(
-
-            nn.LayerNorm(out_dim),
-
-            nn.Linear(out_dim, out_dim // 2),
-
-            nn.GELU(),
-
-            nn.Dropout(dropout),
-
-            nn.Linear(out_dim // 2, 1)
-        )
-
-        self.head = self.head.float()
-
-    def forward(self, ts_x):
-
-        # =====================================================
-        # 1) LSTM
-        # =====================================================
-        ts_tokens = self.ts_encoder(ts_x)
-        # (B,T,H)
-
-        # =====================================================
-        # 2) Projection
-        # =====================================================
-        ts_tokens = self.pre_llm_proj(ts_tokens)
-
-        # =====================================================
-        # 3) LLM
-        # =====================================================
-        B, T, _ = ts_tokens.shape
-
-        attn_mask = torch.ones(
-            B,
-            T,
-            device=ts_tokens.device,
-            dtype=torch.long
-        )
-
-        h = self.llm_enc(
-            ts_tokens,
-            attention_mask=attn_mask
-        )
-
-        # =====================================================
-        # 4) Attention Pooling
-        # =====================================================
-        h = h.to(
-            dtype=next(
-                self.pool_attn.parameters()
-            ).dtype
-        )
-
-        attn_score = self.pool_attn(h)
-
-        attn_weight = torch.softmax(
-            attn_score,
-            dim=1
-        )
-
-        pooled = (
-                h * attn_weight
-        ).sum(dim=1)
-
-        # =====================================================
-        # 5) Regression
-        # =====================================================
-        pooled = pooled.to(
-            dtype=next(
-                self.head.parameters()
-            ).dtype
-        )
-
-        yhat = self.head(
-            pooled
-        ).squeeze(-1)
-
-        return yhat
+
+
+def _safe_mape(y_true, y_pred, eps=1e-8):
+    denom = np.clip(np.abs(y_true), eps, None)
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+
+
+def evaluate(model, device, loader, loss_fn):
+    model.eval()
+
+    loss_sum = 0.0
+    preds = []
+    trues = []
+
+    with torch.no_grad():
+        for batch in loader:
+            x, y, cycle_id = batch
+
+            x = x.float().to(device)
+            y = y.float().to(device)
+            cycle_id = cycle_id.float().to(device)
+
+            pred = model(x, cycle_id)
+            pred = pred.unsqueeze(-1)
+
+            loss = loss_fn(pred, y)
+            loss_sum += loss.item()
+
+            preds.append(pred.detach().cpu())
+            trues.append(y.detach().cpu())
+
+    avg_loss = loss_sum / max(len(loader), 1)
+
+    y_pred = torch.cat(preds, dim=0).numpy().reshape(-1)
+    y_true = torch.cat(trues, dim=0).numpy().reshape(-1)
+
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    mape = _safe_mape(y_true, y_pred)
+
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    r2 = float(1.0 - ss_res / (ss_tot + 1e-8))
+
+    metrics = {
+        "MAE": mae,
+        "MAPE": mape,
+        "RMSE": rmse,
+        "R2": r2
+    }
+
+    return avg_loss, metrics
