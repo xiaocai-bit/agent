@@ -1,11 +1,6 @@
-
-# =========================================================
-# SOH.py
-# TS -> LoRA-Qwen -> SOH
-# =========================================================
-
 import torch
 from torch import nn, optim
+import inspect
 
 from types import SimpleNamespace
 
@@ -13,7 +8,8 @@ from MIT_loader import MITDdataset
 
 from models import (
     LSTMEncoder,
-    TSLLMModel
+    TSLLMModel,
+    PhysicsNet
 )
 
 from train_utils import evaluate
@@ -34,7 +30,7 @@ SOH_CONFIG = {
 
     "batch": 2,
 
-    "batch_size": 4,
+    "batch_size": 32,
 
     "normalized_type": "minmax",
 
@@ -44,8 +40,6 @@ SOH_CONFIG = {
     # LLM
     # =====================================================
     "llm_path": r"D:\Code_LTF\model_fine_turing\large_model\qwen\Qwen3-4B",
-    
-    
 
     # =====================================================
     # training
@@ -53,11 +47,16 @@ SOH_CONFIG = {
     "epochs": 50,
 
     "lr": 1e-4,
+    'use_prompt':False,
 
     "weight_decay": 1e-4,
 
     "dropout": 0.1,
-    "use_prompt": False,
+
+    "physics_lambda": 0.1,
+
+    "monotonic_lambda": 0.05,
+
     # =====================================================
     # misc
     # =====================================================
@@ -65,7 +64,7 @@ SOH_CONFIG = {
 
     "seed": 2023,
 
-    "test_battery_id": 2,
+    "test_battery_id": 1,
 }
 
 
@@ -78,63 +77,78 @@ def run_soh(args, device):
 
     cfg.device = device
 
+    preprocess = getattr(args, "preprocess", None)
+
+    # =====================================================
+    # evaluate wrapper
+    # =====================================================
+    def evaluate_with_optional_preprocess(loader):
+
+        eval_kwargs = {
+            "model": model,
+            "device": device,
+            "loader": loader,
+            "loss_fn": loss_fn
+        }
+
+        try:
+
+            sig = inspect.signature(evaluate)
+
+            if "preprocess" in sig.parameters:
+                eval_kwargs["preprocess"] = preprocess
+
+        except (TypeError, ValueError):
+
+            pass
+
+        return evaluate(**eval_kwargs)
+
     # =====================================================
     # dataset
     # =====================================================
     loader = MITDdataset(cfg)
 
-    if cfg.input_type == "charge":
-
-        data_dict = loader.get_charge_data(
-            test_battery_id=cfg.test_battery_id
-        )
-
-    elif cfg.input_type == "partial_charge":
-
-        data_dict = loader.get_partial_data(
-            test_battery_id=cfg.test_battery_id
-        )
-
-    else:
-
-        data_dict = loader.get_features(
-            test_battery_id=cfg.test_battery_id
-        )
+    data_dict = loader.get_features(
+        test_battery_id=cfg.test_battery_id
+    )
 
     # =====================================================
     # dataloader
+    # must return:
+    # (x, y, cycle_id)
     # =====================================================
     train_loader, val_loader, test_loader = build_dataloaders(
         cfg,
         data_dict
     )
 
-    # preprocess
     # =====================================================
-    if cfg.input_type == "handcraft_features":
+    # preprocess
+    # handcrafted feature + cycle index
+    # 67 + 1 = 68
+    # =====================================================
+    preprocess = nn.Sequential(
 
-        preprocess = nn.Sequential(
+        nn.Flatten(),
 
-            nn.Flatten(),
+        nn.Linear(67, 4 * 128),
 
-            nn.Linear(67, 4 * 128),
+        nn.GELU(),
 
-            nn.GELU(),
+        nn.Unflatten(1, (128, 4))
 
-            nn.Unflatten(1, (4, 128))
-        ).to(device)
-
-    else:
-
-        preprocess = nn.Identity().to(device)
-
+    ).to(device)
 
     # =====================================================
     # TS encoder
     # =====================================================
     ts_encoder = LSTMEncoder(
+
         input_dim=4,
+
         hidden_dim=128
+
     ).to(device)
 
     # =====================================================
@@ -156,19 +170,41 @@ def run_soh(args, device):
 
     ).to(device)
 
-    print("\n[Model] TSLLMModel")
+    # =====================================================
+    # physics net
+    # =====================================================
+    physics_net = PhysicsNet(
+
+        latent_dim=model.llm_enc.hidden_size
+
+    ).to(device)
+
+    print("\n[Model] TSLLMModel + PhysicsNet")
 
     # =====================================================
     # optimizer
     # =====================================================
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
 
-        list(model.parameters()) +
-        list(preprocess.parameters()),
+        list(model.parameters())
+        + list(preprocess.parameters())
+        + list(physics_net.parameters()),
 
         lr=cfg.lr,
 
         weight_decay=cfg.weight_decay
+    )
+
+    # =====================================================
+    # scheduler
+    # =====================================================
+    scheduler = optim.lr_scheduler.MultiStepLR(
+
+        optimizer,
+
+        milestones=[30, 70],
+
+        gamma=0.5
     )
 
     # =====================================================
@@ -177,22 +213,16 @@ def run_soh(args, device):
     loss_fn = nn.MSELoss()
 
     # =====================================================
-    # training initialize
+    # initialize
     # =====================================================
-    best_val = 1e9
-
-    best_metrics = None
+    best_val = 1e10
 
     best_epoch = 0
 
     best_state = None
 
-    train_loss_history = []
-
-    val_loss_history = []
-
     # =====================================================
-    # training start
+    # training
     # =====================================================
     print("\n========================")
     print("Start Training")
@@ -200,40 +230,111 @@ def run_soh(args, device):
 
     for epoch in range(cfg.epochs):
 
-        # =================================================
-        # train
-        # =================================================
         model.train()
+
+        physics_net.train()
 
         train_loss_sum = 0.0
 
+        # =================================================
+        # train loop
+        # =================================================
         for batch in train_loader:
+
             # =============================================
             # batch
             # =============================================
-            ts_x, y = batch
+            ts_x, y, cycle_id = batch
 
-            ts_x = ts_x.to(device)
+            ts_x = ts_x.float().to(device)
 
+            y = y.float().to(device)
 
-            y = y.to(device)
+            cycle_id = cycle_id.float().to(device)
+
+            cycle_id.requires_grad_(True)
 
             # =============================================
             # preprocess
-            # (B,1,20) -> (B,4,128)
+            # =============================================
+            ts_x = preprocess(ts_x)
 
             # =============================================
             # forward
             # =============================================
-            ts_x = preprocess(ts_x)
-            pred = model(ts_x)
+            pred, latent_h = model(
 
-            pred = pred.view_as(y)
+                ts_x,
+
+                return_latent=True
+            )
+
+            pred = pred.unsqueeze(-1)
 
             # =============================================
-            # loss
+            # data loss
             # =============================================
-            loss = loss_fn(pred, y)
+            data_loss = loss_fn(
+                pred,
+                y
+            )
+
+            # =============================================
+            # dSOH/dN
+            # =============================================
+            dsoh_dn = torch.autograd.grad(
+
+                outputs=pred.sum(),
+
+                inputs=cycle_id,
+
+                create_graph=True,
+
+                retain_graph=True
+
+            )[0]
+
+            # =============================================
+            # physics rhs
+            # F(h,SOH,N)
+            # =============================================
+            physics_rhs = physics_net(
+
+                latent_h,
+
+                pred,
+
+                cycle_id
+            )
+
+            # =============================================
+            # physics loss
+            # =============================================
+            physics_loss = (
+
+                (dsoh_dn - physics_rhs) ** 2
+
+            ).mean()
+
+            # =============================================
+            # monotonic degradation
+            # dSOH/dN <= 0
+            # =============================================
+            monotonic_loss = torch.relu(
+                dsoh_dn
+            ).mean()
+
+            # =============================================
+            # total loss
+            # =============================================
+            loss = (
+
+                data_loss
+
+                + cfg.physics_lambda * physics_loss
+
+                + cfg.monotonic_lambda * monotonic_loss
+            )
 
             # =============================================
             # backward
@@ -251,31 +352,22 @@ def run_soh(args, device):
 
             train_loss_sum += loss.item()
 
+        # =================================================
+        # scheduler
+        # =================================================
+        scheduler.step()
 
         # =================================================
         # train loss
         # =================================================
         train_loss = train_loss_sum / len(train_loader)
 
-        train_loss_history.append(train_loss)
-
         # =================================================
         # validation
         # =================================================
-        val_loss, metrics = evaluate(
-
-            model=model,
-
-            preprocess=preprocess,
-
-            device=device,
-
-            loader=val_loader,
-
-            loss_fn=loss_fn
+        val_loss, metrics = evaluate_with_optional_preprocess(
+            val_loader
         )
-
-        val_loss_history.append(val_loss)
 
         lr = optimizer.state_dict()['param_groups'][0]['lr']
 
@@ -283,10 +375,15 @@ def run_soh(args, device):
         # logging
         # =================================================
         print(
+
             f"[SOH] "
+
             f"epoch=[{epoch + 1}/{cfg.epochs}] "
+
             f"train_loss={train_loss:.6f} "
+
             f"val_loss={val_loss:.6f} "
+
             f"lr={lr:.6f}"
         )
 
@@ -302,25 +399,36 @@ def run_soh(args, device):
             best_metrics = metrics
 
             best_state = {
-                "model": model.state_dict()
+
+                "model": model.state_dict(),
+
+                "preprocess": preprocess.state_dict(),
+
+                "physics_net": physics_net.state_dict()
             }
 
             print(
+
                 f"[Best] "
+
                 f"epoch={best_epoch} "
+
                 f"val_loss={best_val:.6f}"
             )
 
             print(
-                f"        "
+
                 f"MAE={metrics['MAE']:.4f} | "
+
                 f"MAPE={metrics['MAPE']:.2f}% | "
+
                 f"RMSE={metrics['RMSE']:.4f} | "
+
                 f"R2={metrics['R2']:.4f}"
             )
 
     # =====================================================
-    # load best model
+    # load best
     # =====================================================
     print("\n========================")
     print("Load Best Model")
@@ -330,8 +438,18 @@ def run_soh(args, device):
         best_state["model"]
     )
 
+    preprocess.load_state_dict(
+        best_state["preprocess"]
+    )
+
+    physics_net.load_state_dict(
+        best_state["physics_net"]
+    )
+
     print(
+
         f"Best epoch = {best_epoch} | "
+
         f"Best val_loss = {best_val:.6f}"
     )
 
@@ -342,17 +460,8 @@ def run_soh(args, device):
     print("FINAL TEST RESULT")
     print("========================")
 
-    test_loss, metrics = evaluate(
-
-        model=model,
-
-        preprocess=preprocess,
-
-        device=device,
-
-        loader=test_loader,
-
-        loss_fn=loss_fn
+    test_loss, metrics = evaluate_with_optional_preprocess(
+        test_loader
     )
 
     print(f"test_loss = {test_loss:.6f}")
