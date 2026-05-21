@@ -1,13 +1,10 @@
 import torch
 from torch import nn, optim
-import inspect
-
 from types import SimpleNamespace
 
 from MIT_loader import MITDdataset
 
 from models import (
-    LSTMEncoder,
     TSLLMModel,
     PhysicsNet
 )
@@ -55,7 +52,7 @@ SOH_CONFIG = {
 
     "physics_lambda": 0.1,
 
-    "monotonic_lambda": 0.05,
+    "monotonic_lambda": 0.005,
 
     # =====================================================
     # misc
@@ -77,8 +74,6 @@ def run_soh(args, device):
 
     cfg.device = device
 
-    preprocess = getattr(args, "preprocess", None)
-
     # =====================================================
     # evaluate wrapper
     # =====================================================
@@ -90,17 +85,6 @@ def run_soh(args, device):
             "loader": loader,
             "loss_fn": loss_fn
         }
-
-        try:
-
-            sig = inspect.signature(evaluate)
-
-            if "preprocess" in sig.parameters:
-                eval_kwargs["preprocess"] = preprocess
-
-        except (TypeError, ValueError):
-
-            pass
 
         return evaluate(**eval_kwargs)
 
@@ -124,41 +108,16 @@ def run_soh(args, device):
     )
 
     # =====================================================
-    # preprocess
-    # handcrafted feature + cycle index
-    # 67 + 1 = 68
-    # =====================================================
-    preprocess = nn.Sequential(
-
-        nn.Flatten(),
-
-        nn.Linear(67, 4 * 128),
-
-        nn.GELU(),
-
-        nn.Unflatten(1, (128, 4))
-
-    ).to(device)
-
-    # =====================================================
-    # TS encoder
-    # =====================================================
-    ts_encoder = LSTMEncoder(
-
-        input_dim=4,
-
-        hidden_dim=128
-
-    ).to(device)
-
-    # =====================================================
     # model
+    # latent token PINN backbone
     # =====================================================
     model = TSLLMModel(
 
-        ts_encoder=ts_encoder,
+        input_dim=67,
 
-        ts_dim=128,
+        num_tokens=4,
+
+        token_dim=128,
 
         llm_path=cfg.llm_path,
 
@@ -187,7 +146,6 @@ def run_soh(args, device):
     optimizer = optim.AdamW(
 
         list(model.parameters())
-        + list(preprocess.parameters())
         + list(physics_net.parameters()),
 
         lr=cfg.lr,
@@ -250,14 +208,7 @@ def run_soh(args, device):
 
             y = y.float().to(device)
 
-            cycle_id = cycle_id.float().to(device)
-
-            cycle_id.requires_grad_(True)
-
-            # =============================================
-            # preprocess
-            # =============================================
-            ts_x = preprocess(ts_x)
+            cycle_norm = cycle_id.float().to(device).requires_grad_(True)
 
             # =============================================
             # forward
@@ -265,6 +216,8 @@ def run_soh(args, device):
             pred, latent_h = model(
 
                 ts_x,
+
+                cycle_norm,
 
                 return_latent=True
             )
@@ -286,7 +239,7 @@ def run_soh(args, device):
 
                 outputs=pred.sum(),
 
-                inputs=cycle_id,
+                inputs=cycle_norm,
 
                 create_graph=True,
 
@@ -304,7 +257,7 @@ def run_soh(args, device):
 
                 pred,
 
-                cycle_id
+                cycle_norm
             )
 
             # =============================================
@@ -312,7 +265,7 @@ def run_soh(args, device):
             # =============================================
             physics_loss = (
 
-                (dsoh_dn - physics_rhs) ** 2
+                (dsoh_dn.squeeze(-1) - physics_rhs) ** 2
 
             ).mean()
 
@@ -321,7 +274,7 @@ def run_soh(args, device):
             # dSOH/dN <= 0
             # =============================================
             monotonic_loss = torch.relu(
-                dsoh_dn
+                dsoh_dn.squeeze(-1)
             ).mean()
 
             # =============================================
@@ -402,8 +355,6 @@ def run_soh(args, device):
 
                 "model": model.state_dict(),
 
-                "preprocess": preprocess.state_dict(),
-
                 "physics_net": physics_net.state_dict()
             }
 
@@ -436,10 +387,6 @@ def run_soh(args, device):
 
     model.load_state_dict(
         best_state["model"]
-    )
-
-    preprocess.load_state_dict(
-        best_state["preprocess"]
     )
 
     physics_net.load_state_dict(
