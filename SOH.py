@@ -1,6 +1,11 @@
 import torch
 from torch import nn, optim
 from types import SimpleNamespace
+from pathlib import Path
+import json
+import csv
+import random
+import numpy as np
 
 from MIT_loader import MITDdataset
 
@@ -9,7 +14,7 @@ from models import (
     PhysicsNet
 )
 
-from train_utils import evaluate
+from train_utils import evaluate, evaluate_with_outputs
 from prompts import build_dataloaders
 
 
@@ -27,7 +32,7 @@ SOH_CONFIG = {
 
     "batch": 2,
 
-    "batch_size": 32,
+    "batch_size": 4,
 
     "normalized_type": "minmax",
 
@@ -71,6 +76,19 @@ SOH_CONFIG = {
 def run_soh(args, device):
 
     cfg = SimpleNamespace(**SOH_CONFIG)
+
+    # use one unified seed from CLI for all modules
+    cfg.seed = int(getattr(args, "seed", cfg.seed))
+    cfg.random_seed = cfg.seed
+
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     cfg.device = device
 
@@ -178,6 +196,8 @@ def run_soh(args, device):
     best_epoch = 0
 
     best_state = None
+    train_loss_history = []
+    val_loss_history = []
 
     # =====================================================
     # training
@@ -314,6 +334,7 @@ def run_soh(args, device):
         # train loss
         # =================================================
         train_loss = train_loss_sum / len(train_loader)
+        train_loss_history.append(float(train_loss))
 
         # =================================================
         # validation
@@ -321,6 +342,7 @@ def run_soh(args, device):
         val_loss, metrics = evaluate_with_optional_preprocess(
             val_loader
         )
+        val_loss_history.append(float(val_loss))
 
         lr = optimizer.state_dict()['param_groups'][0]['lr']
 
@@ -407,8 +429,11 @@ def run_soh(args, device):
     print("FINAL TEST RESULT")
     print("========================")
 
-    test_loss, metrics = evaluate_with_optional_preprocess(
-        test_loader
+    test_loss, metrics, y_pred, y_true = evaluate_with_outputs(
+        model=model,
+        device=device,
+        loader=test_loader,
+        loss_fn=loss_fn
     )
 
     print(f"test_loss = {test_loss:.6f}")
@@ -420,6 +445,45 @@ def run_soh(args, device):
     print(f"RMSE = {metrics['RMSE']:.4f}")
 
     print(f"R2   = {metrics['R2']:.4f}")
+
+    run_name = (
+        f"SOH-{cfg.data}-batch{cfg.batch}-test_battery{cfg.test_battery_id}"
+    )
+    output_root = Path(getattr(args, "result_root", "results"))
+    run_dir = output_root / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = {
+        "task": "SOH",
+        "dataset": cfg.data,
+        "batch": cfg.batch,
+        "test_battery_id": cfg.test_battery_id,
+        "random_seed": cfg.random_seed,
+        "seed": cfg.seed,
+        "physics_lambda": cfg.physics_lambda,
+        "monotonic_lambda": cfg.monotonic_lambda,
+        "best_epoch": best_epoch,
+        "best_val_loss": float(best_val),
+        "test_loss": float(test_loss),
+        "metrics": metrics,
+    }
+
+    with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    with (run_dir / "loss_curve.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "val_loss"])
+        for i, (tr, va) in enumerate(zip(train_loss_history, val_loss_history), start=1):
+            writer.writerow([i, tr, va])
+
+    with (run_dir / "test_pred_true.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["index", "pred", "true"])
+        for idx, (pred, true) in enumerate(zip(y_pred.tolist(), y_true.tolist())):
+            writer.writerow([idx, pred, true])
+
+    print(f"\n[Save] 本次训练结果已保存到: {run_dir}")
 
     print("\n========================")
     print("Training Finished")
