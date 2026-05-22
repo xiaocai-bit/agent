@@ -1,5 +1,5 @@
-import torch
 import argparse
+import torch
 
 from task_router import TaskRouter, LocalQwenClassifier
 from SOH import run_soh
@@ -25,6 +25,7 @@ def main():
     # runtime control（非任务相关）
     # =========================
     parser.add_argument("--seed", type=int, default=2023)
+    parser.add_argument("--result_root", type=str, default="results")
 
     args = parser.parse_args()
 
@@ -48,6 +49,7 @@ def main():
     print("========================\n")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
     # =========================
     # task dispatch
