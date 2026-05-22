@@ -1,0 +1,205 @@
+import argparse
+import os
+import pickle
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from dagmm import DAGMM
+
+FEATURES = [
+    "volt",
+    "current",
+    "soc",
+    "max_single_volt",
+    "min_single_volt",
+    "max_temp",
+    "min_temp",
+    "timestamp",
+]
+
+
+class BatteryPklDataset(Dataset):
+    """一个 pkl 对应一个样本；返回 shape=(T,F) 的时序与 meta。"""
+
+    def __init__(
+        self,
+        root_dir: str,
+        split: str,
+        features: Optional[List[str]] = None,
+        keep_label: Optional[int] = None,
+    ):
+        self.root = Path(root_dir)
+        self.split = split
+        self.features = features or FEATURES
+
+        split_dir = self.root / split
+        if not split_dir.exists():
+            raise FileNotFoundError(f"split 目录不存在: {split_dir}")
+
+        files = sorted(split_dir.glob("*.pkl"))
+        if not files:
+            raise RuntimeError(f"{split_dir} 下没有 pkl 文件")
+
+        if keep_label is None:
+            self.files = files
+        else:
+            self.files = []
+            for fp in files:
+                meta = self._load_meta(fp)
+                if meta.get("label") == keep_label:
+                    self.files.append(fp)
+
+        if not self.files:
+            raise RuntimeError(f"过滤后没有样本: split={split}, keep_label={keep_label}")
+
+    def _read_pkl(self, path: Path):
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        return obj
+
+    def _load_meta(self, path: Path) -> Dict:
+        obj = self._read_pkl(path)
+        if isinstance(obj, tuple) and len(obj) == 2:
+            _, meta = obj
+        elif isinstance(obj, dict) and "meta" in obj:
+            meta = obj["meta"]
+        else:
+            raise ValueError(f"不支持的 pkl 数据结构: {path}")
+        return meta
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx: int):
+        path = self.files[idx]
+        obj = self._read_pkl(path)
+
+        if isinstance(obj, tuple) and len(obj) == 2:
+            x_raw, meta = obj
+        elif isinstance(obj, dict):
+            x_raw = obj.get("X") or obj.get("x")
+            meta = obj.get("meta", {})
+        else:
+            raise ValueError(f"不支持的 pkl 数据结构: {path}")
+
+        # 支持 x_raw 为 np.ndarray 或 dict(feature->seq)
+        if isinstance(x_raw, dict):
+            x = np.stack([np.asarray(x_raw[k], dtype=np.float32) for k in self.features], axis=1)
+        else:
+            x = np.asarray(x_raw, dtype=np.float32)
+            if x.ndim != 2:
+                raise ValueError(f"X 维度错误，应为二维 (T,F): {path}, got {x.shape}")
+
+        # 保证 T=128，若不等长可按需裁切/补齐
+        if x.shape[0] != 128:
+            if x.shape[0] > 128:
+                x = x[:128]
+            else:
+                pad = np.repeat(x[-1:], repeats=128 - x.shape[0], axis=0)
+                x = np.concatenate([x, pad], axis=0)
+
+        return {
+            "x": torch.tensor(x, dtype=torch.float32),
+            "label": int(meta.get("label", -1)),
+            "meta": {
+                "car": meta.get("car"),
+                "charge_segment": meta.get("charge_segment"),
+                "mileage": meta.get("mileage"),
+            },
+            "path": str(path),
+        }
+
+
+def collate_fn(batch: List[Dict]):
+    x = torch.stack([b["x"] for b in batch], dim=0)  # (B,T,F)
+    label = torch.tensor([b["label"] for b in batch], dtype=torch.long)
+    meta = [b["meta"] for b in batch]
+    path = [b["path"] for b in batch]
+    return {"x": x, "label": label, "meta": meta, "path": path}
+
+
+def build_ad_dataloaders(data_root: str, batch_size: int = 256, num_workers: int = 4):
+    # DAGMM 训练只用正常样本
+    train_ds = BatteryPklDataset(data_root, split="train", keep_label=0)
+    test_ds = BatteryPklDataset(data_root, split="test", keep_label=None)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+    return train_loader, test_loader
+
+
+def run_ad(args, device):
+    train_loader, test_loader = build_ad_dataloaders(
+        data_root=args.ad_data_root,
+        batch_size=args.ad_batch_size,
+        num_workers=args.ad_num_workers,
+    )
+
+    # 输入 128x8 展平给 DAGMM
+    input_dim = 128 * len(FEATURES)
+    model = DAGMM(input_dim=input_dim, latent_dim=args.ad_latent_dim, n_gmm=args.ad_n_gmm).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.ad_lr)
+
+    model.train()
+    for epoch in range(args.ad_epochs):
+        loss_sum = 0.0
+        for batch in train_loader:
+            x = batch["x"].to(device)  # (B,128,8)
+            x = x.reshape(x.size(0), -1)
+            out = model(x)
+            loss, _ = model.loss(x, out)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            loss_sum += loss.item()
+        print(f"[AD][Epoch {epoch+1}/{args.ad_epochs}] loss={loss_sum/len(train_loader):.6f}")
+
+    # 推理阶段：输出 test 的 energy 分数，可按分位数阈值区分异常
+    model.eval()
+    all_energy, all_label = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            x = batch["x"].to(device).reshape(batch["x"].size(0), -1)
+            out = model(x)
+            all_energy.append(out["energy"].cpu())
+            all_label.append(batch["label"])
+
+    energy = torch.cat(all_energy).numpy()
+    label = torch.cat(all_label).numpy()
+    thr = np.quantile(energy, 0.95)
+    pred = (energy > thr).astype(np.int32) * 10
+    print(f"[AD] test samples={len(label)}, threshold@95%={thr:.6f}")
+    print(f"[AD] abnormal(pred==10) ratio={(pred==10).mean():.4f}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ad_data_root", type=str, required=True)
+    parser.add_argument("--ad_batch_size", type=int, default=256)
+    parser.add_argument("--ad_num_workers", type=int, default=4)
+    parser.add_argument("--ad_epochs", type=int, default=20)
+    parser.add_argument("--ad_lr", type=float, default=1e-3)
+    parser.add_argument("--ad_latent_dim", type=int, default=8)
+    parser.add_argument("--ad_n_gmm", type=int, default=4)
+    args = parser.parse_args()
+
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    run_ad(args, dev)
