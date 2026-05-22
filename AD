@@ -50,15 +50,18 @@ class BatteryPklDataset(Dataset):
             self.files = []
             for fp in files:
                 meta = self._load_meta(fp)
-                if meta.get("label") == keep_label:
+                if str(meta["label"]) == str(keep_label):
                     self.files.append(fp)
 
         if not self.files:
             raise RuntimeError(f"过滤后没有样本: split={split}, keep_label={keep_label}")
 
     def _read_pkl(self, path: Path):
-        with open(path, "rb") as f:
-            obj = pickle.load(f)
+        obj = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False
+        )
         return obj
 
     def _load_meta(self, path: Path) -> Dict:
@@ -124,7 +127,7 @@ def collate_fn(batch: List[Dict]):
 
 def build_ad_dataloaders(data_root: str, batch_size: int = 256, num_workers: int = 4):
     # DAGMM 训练只用正常样本
-    train_ds = BatteryPklDataset(data_root, split="train", keep_label=0)
+    train_ds = BatteryPklDataset(data_root, split="train", keep_label = "00")
     test_ds = BatteryPklDataset(data_root, split="test", keep_label=None)
 
     train_loader = DataLoader(
