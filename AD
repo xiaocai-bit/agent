@@ -1,8 +1,6 @@
 import argparse
-import os
-import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -30,7 +28,7 @@ class BatteryPklDataset(Dataset):
         root_dir: str,
         split: str,
         features: Optional[List[str]] = None,
-        keep_label: Optional[int] = None,
+        keep_label: Optional[str] = None,
     ):
         self.root = Path(root_dir)
         self.split = split
@@ -50,19 +48,14 @@ class BatteryPklDataset(Dataset):
             self.files = []
             for fp in files:
                 meta = self._load_meta(fp)
-                if str(meta["label"]) == str(keep_label):
+                if str(meta.get("label")) == str(keep_label):
                     self.files.append(fp)
 
         if not self.files:
             raise RuntimeError(f"过滤后没有样本: split={split}, keep_label={keep_label}")
 
     def _read_pkl(self, path: Path):
-        obj = torch.load(
-            path,
-            map_location="cpu",
-            weights_only=False
-        )
-        return obj
+        return torch.load(path, map_location="cpu", weights_only=False)
 
     def _load_meta(self, path: Path) -> Dict:
         obj = self._read_pkl(path)
@@ -89,7 +82,6 @@ class BatteryPklDataset(Dataset):
         else:
             raise ValueError(f"不支持的 pkl 数据结构: {path}")
 
-        # 支持 x_raw 为 np.ndarray 或 dict(feature->seq)
         if isinstance(x_raw, dict):
             x = np.stack([np.asarray(x_raw[k], dtype=np.float32) for k in self.features], axis=1)
         else:
@@ -97,7 +89,6 @@ class BatteryPklDataset(Dataset):
             if x.ndim != 2:
                 raise ValueError(f"X 维度错误，应为二维 (T,F): {path}, got {x.shape}")
 
-        # 保证 T=128，若不等长可按需裁切/补齐
         if x.shape[0] != 128:
             if x.shape[0] > 128:
                 x = x[:128]
@@ -125,9 +116,38 @@ def collate_fn(batch: List[Dict]):
     return {"x": x, "label": label, "meta": meta, "path": path}
 
 
+def _compute_feature_norm_stats(loader: DataLoader, device: torch.device):
+    """基于训练集计算逐特征均值/方差（跨 batch 与时间维）。"""
+    feat_sum = None
+    feat_sq_sum = None
+    count = 0
+
+    for batch in loader:
+        x = batch["x"].to(device=device, dtype=torch.float32)  # (B,T,F)
+        if feat_sum is None:
+            f = x.size(-1)
+            feat_sum = torch.zeros(f, device=device)
+            feat_sq_sum = torch.zeros(f, device=device)
+
+        feat_sum += x.sum(dim=(0, 1))
+        feat_sq_sum += (x * x).sum(dim=(0, 1))
+        count += x.size(0) * x.size(1)
+
+    if feat_sum is None or feat_sq_sum is None or count == 0:
+        raise RuntimeError("训练集为空，无法计算归一化统计量")
+
+    mean = feat_sum / count
+    var = feat_sq_sum / count - mean * mean
+    std = torch.sqrt(torch.clamp(var, min=1e-8))
+    return mean, std
+
+
+def _normalize_batch(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
+    return (x - mean.view(1, 1, -1)) / std.view(1, 1, -1)
+
+
 def build_ad_dataloaders(data_root: str, batch_size: int = 256, num_workers: int = 4):
-    # DAGMM 训练只用正常样本
-    train_ds = BatteryPklDataset(data_root, split="train", keep_label = "00")
+    train_ds = BatteryPklDataset(data_root, split="train", keep_label="00")
     test_ds = BatteryPklDataset(data_root, split="test", keep_label=None)
 
     train_loader = DataLoader(
@@ -156,7 +176,8 @@ def run_ad(args, device):
         num_workers=args.ad_num_workers,
     )
 
-    # 输入 128x8 展平给 DAGMM
+    norm_mean, norm_std = _compute_feature_norm_stats(train_loader, device)
+
     input_dim = 128 * len(FEATURES)
     model = DAGMM(input_dim=input_dim, latent_dim=args.ad_latent_dim, n_gmm=args.ad_n_gmm).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.ad_lr)
@@ -166,7 +187,7 @@ def run_ad(args, device):
         loss_sum = 0.0
         for batch in train_loader:
             x = batch["x"].to(device)  # (B,128,8)
-            x = x.reshape(x.size(0), -1)
+            x = _normalize_batch(x, norm_mean, norm_std).reshape(x.size(0), -1)
             out = model(x)
             loss, _ = model.loss(x, out)
             optimizer.zero_grad()
@@ -175,12 +196,12 @@ def run_ad(args, device):
             loss_sum += loss.item()
         print(f"[AD][Epoch {epoch+1}/{args.ad_epochs}] loss={loss_sum/len(train_loader):.6f}")
 
-    # 推理阶段：输出 test 的 energy 分数，可按分位数阈值区分异常
     model.eval()
     all_energy, all_label = [], []
     with torch.no_grad():
         for batch in test_loader:
-            x = batch["x"].to(device).reshape(batch["x"].size(0), -1)
+            x = batch["x"].to(device)
+            x = _normalize_batch(x, norm_mean, norm_std).reshape(x.size(0), -1)
             out = model(x)
             all_energy.append(out["energy"].cpu())
             all_label.append(batch["label"])
@@ -199,7 +220,7 @@ if __name__ == "__main__":
     parser.add_argument("--ad_batch_size", type=int, default=256)
     parser.add_argument("--ad_num_workers", type=int, default=4)
     parser.add_argument("--ad_epochs", type=int, default=20)
-    parser.add_argument("--ad_lr", type=float, default=1e-3)
+    parser.add_argument("--ad_lr", type=float, default=1e-4)
     parser.add_argument("--ad_latent_dim", type=int, default=8)
     parser.add_argument("--ad_n_gmm", type=int, default=4)
     args = parser.parse_args()
