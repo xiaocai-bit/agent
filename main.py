@@ -29,13 +29,13 @@ def main():
     parser.add_argument("--result_root", type=str, default="results")
 
     # AD args
-    parser.add_argument("--ad_data_root", type=str, default=r"E:\data\battery-agent\异常监测数据\battery_brand2")
+    parser.add_argument("--ad_data_root", type=str, default=r"E:\data\battery-agent\异常监测数据")
     parser.add_argument("--ad_batch_size", type=int, default=256)
     parser.add_argument("--ad_num_workers", type=int, default=4)
-    parser.add_argument("--ad_epochs", type=int, default=10)
+    parser.add_argument("--ad_epochs", type=int, default=20)
     parser.add_argument("--ad_lr", type=float, default=1e-4)
     parser.add_argument("--ad_latent_dim", type=int, default=8)
-    parser.add_argument("--ad_n_gmm", type=int, default=4)
+    parser.add_argument("--ad_n_gmm", type=int, default=9)
     parser.add_argument("--ad_val_ratio", type=float, default=0.2)
 
     args = parser.parse_args()
