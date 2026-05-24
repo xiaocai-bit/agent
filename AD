@@ -11,49 +11,27 @@ from torch.utils.data import DataLoader, Dataset
 
 from dagmm import DAGMM
 
-FEATURES = [
-    "volt",
-    "current",
-    "soc",
-    "max_single_volt",
-    "min_single_volt",
-    "max_temp",
-    "min_temp",
-    "timestamp",
-]
+FEATURES = ["volt", "current", "soc", "max_single_volt", "min_single_volt", "max_temp", "min_temp", "timestamp"]
 
 
 class BatteryPklDataset(Dataset):
-    """一个 pkl 对应一个样本；返回 shape=(T,F) 的时序与 meta。"""
-
-    def __init__(
-        self,
-        root_dir: str,
-        split: str,
-        features: Optional[List[str]] = None,
-        keep_label: Optional[str] = None,
-    ):
+    def __init__(self, root_dir: str, split: str, features: Optional[List[str]] = None, keep_label: Optional[str] = None):
         self.root = Path(root_dir)
-        self.split = split
         self.features = features or FEATURES
-
         split_dir = self.root / split
         if not split_dir.exists():
             raise FileNotFoundError(f"split 目录不存在: {split_dir}")
-
         files = sorted(split_dir.glob("*.pkl"))
         if not files:
             raise RuntimeError(f"{split_dir} 下没有 pkl 文件")
-
-        if keep_label is None:
-            self.files = files
-        else:
-            self.files = []
-            for fp in files:
+        self.files = []
+        for fp in files:
+            if keep_label is None:
+                self.files.append(fp)
+            else:
                 meta = self._load_meta(fp)
                 if str(meta.get("label")).strip() == str(keep_label).strip():
                     self.files.append(fp)
-
         if not self.files:
             raise RuntimeError(f"过滤后没有样本: split={split}, keep_label={keep_label}")
 
@@ -76,7 +54,6 @@ class BatteryPklDataset(Dataset):
     def __getitem__(self, idx: int):
         path = self.files[idx]
         obj = self._read_pkl(path)
-
         if isinstance(obj, tuple) and len(obj) == 2:
             x_raw, meta = obj
         elif isinstance(obj, dict):
@@ -89,40 +66,20 @@ class BatteryPklDataset(Dataset):
             x = np.stack([np.asarray(x_raw[k], dtype=np.float32) for k in self.features], axis=1)
         else:
             x = np.asarray(x_raw, dtype=np.float32)
-            if x.ndim != 2:
-                raise ValueError(f"X 维度错误，应为二维 (T,F): {path}, got {x.shape}")
-
         if x.shape[0] != 128:
             if x.shape[0] > 128:
                 x = x[:128]
             else:
-                pad = np.repeat(x[-1:], repeats=128 - x.shape[0], axis=0)
-                x = np.concatenate([x, pad], axis=0)
-
-        return {
-            "x": torch.tensor(x, dtype=torch.float32),
-            "label": str(meta.get("label", "-1")).strip(),
-            "meta": {
-                "car": meta.get("car"),
-                "charge_segment": meta.get("charge_segment"),
-                "mileage": meta.get("mileage"),
-            },
-            "path": str(path),
-        }
+                x = np.concatenate([x, np.repeat(x[-1:], repeats=128 - x.shape[0], axis=0)], axis=0)
+        return {"x": torch.tensor(x, dtype=torch.float32), "label": str(meta.get("label", "-1")).strip(), "path": str(path)}
 
 
 def collate_fn(batch: List[Dict]):
-    x = torch.stack([b["x"] for b in batch], dim=0)
-    label = [b["label"] for b in batch]
-    meta = [b["meta"] for b in batch]
-    path = [b["path"] for b in batch]
-    return {"x": x, "label": label, "meta": meta, "path": path}
+    return {"x": torch.stack([b["x"] for b in batch], dim=0), "label": [b["label"] for b in batch], "path": [b["path"] for b in batch]}
 
 
 def _compute_feature_norm_stats(loader: DataLoader, device: torch.device):
-    feat_sum = None
-    feat_sq_sum = None
-    count = 0
+    feat_sum, feat_sq_sum, count = None, None, 0
     for batch in loader:
         x = batch["x"].to(device=device, dtype=torch.float32)
         if feat_sum is None:
@@ -132,11 +89,8 @@ def _compute_feature_norm_stats(loader: DataLoader, device: torch.device):
         feat_sum += x.sum(dim=(0, 1))
         feat_sq_sum += (x * x).sum(dim=(0, 1))
         count += x.size(0) * x.size(1)
-    if feat_sum is None or count == 0:
-        raise RuntimeError("训练集为空，无法计算归一化统计量")
     mean = feat_sum / count
-    var = feat_sq_sum / count - mean * mean
-    std = torch.sqrt(torch.clamp(var, min=1e-8))
+    std = torch.sqrt(torch.clamp(feat_sq_sum / count - mean * mean, min=1e-8))
     return mean, std
 
 
@@ -144,61 +98,57 @@ def _normalize_batch(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
     return (x - mean.view(1, 1, -1)) / std.view(1, 1, -1)
 
 
-def _split_val_from_train_all(train_all_ds: BatteryPklDataset, val_ratio: float, seed: int):
-    n = len(train_all_ds)
-    n_val = max(1, int(n * val_ratio))
+def _stratified_split_indices(labels: List[str], val_ratio: float, seed: int):
+    groups = {}
+    for i, lb in enumerate(labels):
+        groups.setdefault(str(lb).strip(), []).append(i)
     g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(n, generator=g).tolist()
-    val_idx = perm[:n_val]
-    train_idx = perm[n_val:]
-    if not train_idx:
-        raise RuntimeError("训练集切分后 train 为空，请减小 val_ratio")
-    return torch.utils.data.Subset(train_all_ds, train_idx), torch.utils.data.Subset(train_all_ds, val_idx)
+    val_idx, test_idx = [], []
+    for idxs in groups.values():
+        perm = torch.randperm(len(idxs), generator=g).tolist()
+        n_val = max(1, int(len(idxs) * val_ratio))
+        if len(idxs) > 1:
+            n_val = min(n_val, len(idxs) - 1)
+        pick_val = [idxs[j] for j in perm[:n_val]]
+        pick_test = [idxs[j] for j in perm[n_val:]]
+        if not pick_test:
+            pick_test, pick_val = pick_val[-1:], pick_val[:-1]
+        val_idx.extend(pick_val)
+        test_idx.extend(pick_test)
+    return val_idx, test_idx
 
 
 def build_ad_dataloaders(data_root: str, batch_size: int = 256, num_workers: int = 4, val_ratio: float = 0.2, seed: int = 2023):
-    # 训练：仅正常样本
     train_ds = BatteryPklDataset(data_root, split="train", keep_label="00")
-    # 验证：从 train 全量(含标签)切分，避免直接在 test 上调阈值
-    train_all = BatteryPklDataset(data_root, split="train", keep_label=None)
-    _, val_ds = _split_val_from_train_all(train_all, val_ratio=val_ratio, seed=seed)
-    test_ds = BatteryPklDataset(data_root, split="test", keep_label=None)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn)
-    return train_loader, val_loader, test_loader
+    test_all = BatteryPklDataset(data_root, split="test", keep_label=None)
+    labels = [test_all[i]["label"] for i in range(len(test_all))]
+    val_idx, test_idx = _stratified_split_indices(labels, val_ratio=val_ratio, seed=seed)
+    val_ds = torch.utils.data.Subset(test_all, val_idx)
+    test_ds = torch.utils.data.Subset(test_all, test_idx)
+    return (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn),
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn),
+        DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn),
+    )
 
 
 def _binarize_label(labels: List[str]) -> np.ndarray:
-    arr = np.zeros(len(labels), dtype=np.int32)
-    for i, v in enumerate(labels):
-        s = str(v).strip()
-        arr[i] = 0 if s in {"0", "00"} else 1
-    return arr
+    return np.array([0 if str(v).strip() in {"0", "00"} else 1 for v in labels], dtype=np.int32)
 
 
 def _classification_metrics(y_true: np.ndarray, y_pred: np.ndarray):
-    tp = int(np.sum((y_true == 1) & (y_pred == 1)))
-    tn = int(np.sum((y_true == 0) & (y_pred == 0)))
-    fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-    fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-    precision = tp / (tp + fp + 1e-12)
-    recall = tp / (tp + fn + 1e-12)
-    f1 = 2 * precision * recall / (precision + recall + 1e-12)
-    acc = (tp + tn) / max(tp + tn + fp + fn, 1)
+    tp = int(np.sum((y_true == 1) & (y_pred == 1))); tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+    fp = int(np.sum((y_true == 0) & (y_pred == 1))); fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+    precision = tp / (tp + fp + 1e-12); recall = tp / (tp + fn + 1e-12)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12); acc = (tp + tn) / max(tp + tn + fp + fn, 1)
     return {"precision": precision, "recall": recall, "f1": f1, "acc": acc, "tp": tp, "tn": tn, "fp": fp, "fn": fn}
 
 
 def _roc_auc_score(y_true: np.ndarray, y_score: np.ndarray):
-    pos = y_true == 1
-    neg = y_true == 0
-    n_pos, n_neg = int(pos.sum()), int(neg.sum())
+    pos = y_true == 1; neg = y_true == 0; n_pos, n_neg = int(pos.sum()), int(neg.sum())
     if n_pos == 0 or n_neg == 0:
         return float("nan")
-    order = np.argsort(y_score)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
+    order = np.argsort(y_score); ranks = np.empty_like(order, dtype=np.float64); ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
     return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
@@ -206,24 +156,18 @@ def _pr_auc_score(y_true: np.ndarray, y_score: np.ndarray):
     n_pos = int((y_true == 1).sum())
     if n_pos == 0:
         return float("nan")
-    order = np.argsort(-y_score)
-    ys = y_true[order]
-    tp = np.cumsum(ys == 1)
-    fp = np.cumsum(ys == 0)
-    recall = tp / n_pos
-    precision = tp / np.maximum(tp + fp, 1)
-    recall = np.concatenate([[0.0], recall])
-    precision = np.concatenate([[1.0], precision])
-    return float(np.trapz(precision, recall))
+    order = np.argsort(-y_score); ys = y_true[order]
+    tp = np.cumsum(ys == 1); fp = np.cumsum(ys == 0)
+    recall = tp / n_pos; precision = tp / np.maximum(tp + fp, 1)
+    return float(np.trapz(np.concatenate([[1.0], precision]), np.concatenate([[0.0], recall])))
 
 
 def _collect_energy_and_label(model, loader, device, norm_mean, norm_std):
     all_energy, all_label = [], []
     with torch.no_grad():
         for batch in loader:
-            x = _normalize_batch(batch["x"].to(device), norm_mean, norm_std).reshape(batch["x"].size(0), -1)
-            out = model(x)
-            all_energy.append(out["energy"].cpu())
+            x = _normalize_batch(batch["x"].to(device), norm_mean, norm_std)
+            all_energy.append(model(x)["energy"].cpu())
             all_label.extend(batch["label"])
     return torch.cat(all_energy).numpy(), np.array(all_label, dtype=object)
 
@@ -239,97 +183,52 @@ def _find_best_f1_threshold(y_true_bin: np.ndarray, scores: np.ndarray) -> Tuple
 
 
 def run_ad(args, device):
-    train_loader, val_loader, test_loader = build_ad_dataloaders(
-        data_root=args.ad_data_root,
-        batch_size=args.ad_batch_size,
-        num_workers=args.ad_num_workers,
-        val_ratio=args.ad_val_ratio,
-        seed=int(getattr(args, "seed", 2023)),
-    )
-
+    train_loader, val_loader, test_loader = build_ad_dataloaders(args.ad_data_root, args.ad_batch_size, args.ad_num_workers, args.ad_val_ratio, int(getattr(args, "seed", 2023)))
     norm_mean, norm_std = _compute_feature_norm_stats(train_loader, device)
-
-    input_dim = 128 * len(FEATURES)
-    model = DAGMM(input_dim=input_dim, latent_dim=args.ad_latent_dim, n_gmm=args.ad_n_gmm).to(device)
+    model = DAGMM(input_dim=128 * len(FEATURES), latent_dim=args.ad_latent_dim, n_gmm=args.ad_n_gmm, seq_len=128, feature_dim=len(FEATURES)).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.ad_lr)
 
-    train_loss_history = []
-    model.train()
+    epoch_metrics = []
     for epoch in range(args.ad_epochs):
-        loss_sum = 0.0
+        model.train(); loss_sum = 0.0
         for batch in train_loader:
-            x = _normalize_batch(batch["x"].to(device), norm_mean, norm_std).reshape(batch["x"].size(0), -1)
-            out = model(x)
-            loss, _ = model.loss(x, out)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            loss_sum += loss.item()
-        epoch_loss = loss_sum / len(train_loader)
-        train_loss_history.append(float(epoch_loss))
-        print(f"[AD][Epoch {epoch + 1}/{args.ad_epochs}] loss={epoch_loss:.6f}")
+            x = _normalize_batch(batch["x"].to(device), norm_mean, norm_std)
+            out = model(x); loss, _ = model.loss(x, out)
+            optimizer.zero_grad(); loss.backward(); optimizer.step(); loss_sum += loss.item()
+        train_loss = loss_sum / len(train_loader)
 
-    model.eval()
+        model.eval(); val_loss_sum = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                x = _normalize_batch(batch["x"].to(device), norm_mean, norm_std)
+                vloss, _ = model.loss(x, model(x)); val_loss_sum += vloss.item()
+        val_loss = val_loss_sum / len(val_loader)
+
+        val_energy, val_label_raw = _collect_energy_and_label(model, val_loader, device, norm_mean, norm_std)
+        y_val = _binarize_label(val_label_raw.tolist())
+        thr, _ = _find_best_f1_threshold(y_val, val_energy)
+        val_pred = (val_energy > thr).astype(np.int32)
+        vm = _classification_metrics(y_val, val_pred); val_auc = _roc_auc_score(y_val, val_energy)
+
+        epoch_metrics.append({"epoch": epoch + 1, "train_loss": float(train_loss), "val_loss": float(val_loss), "val_auc": float(val_auc), "val_f1": float(vm["f1"]), "val_acc": float(vm["acc"]), "val_threshold": float(thr)})
+        print(f"[AD][Epoch {epoch + 1}/{args.ad_epochs}] train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_auc={val_auc:.4f} val_f1={vm['f1']:.4f} val_acc={vm['acc']:.4f} thr={thr:.6f}")
+
     val_energy, val_label_raw = _collect_energy_and_label(model, val_loader, device, norm_mean, norm_std)
     test_energy, test_label_raw = _collect_energy_and_label(model, test_loader, device, norm_mean, norm_std)
-
-    y_val = _binarize_label(val_label_raw.tolist())
-    y_test = _binarize_label(test_label_raw.tolist())
-
+    y_val = _binarize_label(val_label_raw.tolist()); y_test = _binarize_label(test_label_raw.tolist())
     thr, best_val_f1 = _find_best_f1_threshold(y_val, val_energy)
     test_pred = (test_energy > thr).astype(np.int32)
-
     m = _classification_metrics(y_test, test_pred)
-    roc_auc = _roc_auc_score(y_test, test_energy)
-    pr_auc = _pr_auc_score(y_test, test_energy)
+    roc_auc = _roc_auc_score(y_test, test_energy); pr_auc = _pr_auc_score(y_test, test_energy)
 
-    print(f"[AD] val samples={len(y_val)}, best_f1_threshold={thr:.6f}, val_best_f1={best_val_f1:.4f}")
-    print(f"[AD] test samples={len(y_test)}")
-    print(f"[AD] test metrics: AUC={roc_auc:.4f}, PR-AUC={pr_auc:.4f}, F1={m['f1']:.4f}, Precision={m['precision']:.4f}, Recall={m['recall']:.4f}")
-
-    run_name = f"AD-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    run_dir = Path(getattr(args, "result_root", "results")) / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    summary = {
-        "task": "AD",
-        "run_name": run_name,
-        "seed": int(getattr(args, "seed", 2023)),
-        "device": str(device),
-        "train_normal_label": "00",
-        "train_samples": len(train_loader.dataset),
-        "val_samples": len(val_loader.dataset),
-        "test_samples": len(test_loader.dataset),
-        "epochs": int(args.ad_epochs),
-        "lr": float(args.ad_lr),
-        "latent_dim": int(args.ad_latent_dim),
-        "n_gmm": int(args.ad_n_gmm),
-        "val_ratio": float(args.ad_val_ratio),
-        "best_f1_threshold_on_val": float(thr),
-        "val_best_f1": float(best_val_f1),
-        "test_metrics": {
-            "auc": float(roc_auc),
-            "pr_auc": float(pr_auc),
-            "f1": float(m["f1"]),
-            "precision": float(m["precision"]),
-            "recall": float(m["recall"]),
-            "accuracy": float(m["acc"]),
-            "tp": int(m["tp"]),
-            "tn": int(m["tn"]),
-            "fp": int(m["fp"]),
-            "fn": int(m["fn"]),
-        },
-    }
-
-    with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    run_name = f"AD-{datetime.now().strftime('%Y%m%d-%H%M%S')}"; run_dir = Path(getattr(args, "result_root", "results")) / run_name; run_dir.mkdir(parents=True, exist_ok=True)
+    summary = {"task": "AD", "run_name": run_name, "epoch_metrics": epoch_metrics, "best_f1_threshold_on_val": float(thr), "val_best_f1": float(best_val_f1), "test_metrics": {"auc": float(roc_auc), "pr_auc": float(pr_auc), "f1": float(m["f1"]), "precision": float(m["precision"]), "recall": float(m["recall"]), "accuracy": float(m["acc"])}}
+    (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     with (run_dir / "train_loss_curve.csv").open("w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["epoch", "train_loss"])
-        for i, loss in enumerate(train_loss_history, start=1):
-            w.writerow([i, loss])
-
+        w = csv.writer(f); w.writerow(["epoch", "train_loss", "val_loss", "val_auc", "val_f1", "val_acc", "val_threshold"])
+        for row in epoch_metrics:
+            w.writerow([row["epoch"], row["train_loss"], row["val_loss"], row["val_auc"], row["val_f1"], row["val_acc"], row["val_threshold"]])
     with (run_dir / "val_scores_labels.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["index", "energy", "label_raw", "label_bin"])
@@ -342,6 +241,8 @@ def run_ad(args, device):
         for i, (e, raw, b, p) in enumerate(zip(test_energy.tolist(), test_label_raw.tolist(), y_test.tolist(), test_pred.tolist())):
             w.writerow([i, e, raw, b, p])
 
+    print(f"[AD] val samples={len(y_val)}, best_f1_threshold={thr:.6f}, val_best_f1={best_val_f1:.4f}")
+    print(f"[AD] test metrics: AUC={roc_auc:.4f}, PR-AUC={pr_auc:.4f}, F1={m['f1']:.4f}, Precision={m['precision']:.4f}, Recall={m['recall']:.4f}")
     print(f"[AD][Save] 本次训练结果已保存到: {run_dir}")
 
 
@@ -352,12 +253,10 @@ if __name__ == "__main__":
     parser.add_argument("--ad_num_workers", type=int, default=4)
     parser.add_argument("--ad_epochs", type=int, default=20)
     parser.add_argument("--ad_lr", type=float, default=1e-3)
-    parser.add_argument("--ad_latent_dim", type=int, default=8)
+    parser.add_argument("--ad_latent_dim", type=int, default=64)
     parser.add_argument("--ad_n_gmm", type=int, default=4)
     parser.add_argument("--ad_val_ratio", type=float, default=0.2)
     parser.add_argument("--result_root", type=str, default="results")
     parser.add_argument("--seed", type=int, default=2023)
     args = parser.parse_args()
-
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_ad(args, dev)
+    run_ad(args, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
