@@ -148,7 +148,9 @@ def _roc_auc_score(y_true: np.ndarray, y_score: np.ndarray):
     pos = y_true == 1; neg = y_true == 0; n_pos, n_neg = int(pos.sum()), int(neg.sum())
     if n_pos == 0 or n_neg == 0:
         return float("nan")
-    order = np.argsort(y_score); ranks = np.empty_like(order, dtype=np.float64); ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
+    order = np.argsort(y_score);
+    ranks = np.empty_like(order, dtype=np.float64);
+    ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
     return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
@@ -156,9 +158,12 @@ def _pr_auc_score(y_true: np.ndarray, y_score: np.ndarray):
     n_pos = int((y_true == 1).sum())
     if n_pos == 0:
         return float("nan")
-    order = np.argsort(-y_score); ys = y_true[order]
-    tp = np.cumsum(ys == 1); fp = np.cumsum(ys == 0)
-    recall = tp / n_pos; precision = tp / np.maximum(tp + fp, 1)
+    order = np.argsort(-y_score);
+    ys = y_true[order]
+    tp = np.cumsum(ys == 1);
+    fp = np.cumsum(ys == 0)
+    recall = tp / n_pos;
+    precision = tp / np.maximum(tp + fp, 1)
     return float(np.trapz(np.concatenate([[1.0], precision]), np.concatenate([[0.0], recall])))
 
 
@@ -172,63 +177,100 @@ def _collect_energy_and_label(model, loader, device, norm_mean, norm_std):
     return torch.cat(all_energy).numpy(), np.array(all_label, dtype=object)
 
 
-def _find_best_f1_threshold(y_true_bin: np.ndarray, scores: np.ndarray) -> Tuple[float, float]:
-    best_thr, best_f1 = float(scores.min()), -1.0
+def _find_best_f1_threshold(y_true_bin: np.ndarray, scores: np.ndarray) -> Tuple[float, float, str]:
+    best_thr, best_f1, best_direction = float(scores.min()), -1.0, ">"
     for thr in np.unique(scores):
-        pred = (scores > thr).astype(np.int32)
-        f1 = _classification_metrics(y_true_bin, pred)["f1"]
-        if f1 > best_f1:
-            best_f1, best_thr = f1, float(thr)
-    return best_thr, best_f1
+        pred_gt = (scores > thr).astype(np.int32)
+        f1_gt = _classification_metrics(y_true_bin, pred_gt)["f1"]
+        if f1_gt > best_f1:
+            best_f1, best_thr, best_direction = f1_gt, float(thr), ">"
+
+        pred_lt = (scores < thr).astype(np.int32)
+        f1_lt = _classification_metrics(y_true_bin, pred_lt)["f1"]
+        if f1_lt > best_f1:
+            best_f1, best_thr, best_direction = f1_lt, float(thr), "<"
+
+    return best_thr, best_f1, best_direction
 
 
 def run_ad(args, device):
-    train_loader, val_loader, test_loader = build_ad_dataloaders(args.ad_data_root, args.ad_batch_size, args.ad_num_workers, args.ad_val_ratio, int(getattr(args, "seed", 2023)))
+    train_loader, val_loader, test_loader = build_ad_dataloaders(args.ad_data_root, args.ad_batch_size,
+                                                                 args.ad_num_workers, args.ad_val_ratio,
+                                                                 int(getattr(args, "seed", 2023)))
     norm_mean, norm_std = _compute_feature_norm_stats(train_loader, device)
-    model = DAGMM(input_dim=128 * len(FEATURES), latent_dim=args.ad_latent_dim, n_gmm=args.ad_n_gmm, seq_len=128, feature_dim=len(FEATURES)).to(device)
+    model = DAGMM(input_dim=128 * len(FEATURES), latent_dim=args.ad_latent_dim, n_gmm=args.ad_n_gmm, seq_len=128,
+                  feature_dim=len(FEATURES)).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.ad_lr)
 
     epoch_metrics = []
     for epoch in range(args.ad_epochs):
-        model.train(); loss_sum = 0.0
+        model.train();
+        loss_sum = 0.0
         for batch in train_loader:
             x = _normalize_batch(batch["x"].to(device), norm_mean, norm_std)
-            out = model(x); loss, _ = model.loss(x, out)
-            optimizer.zero_grad(); loss.backward(); optimizer.step(); loss_sum += loss.item()
+            out = model(x);
+            loss, _ = model.loss(x, out)
+            optimizer.zero_grad();
+            loss.backward();
+            optimizer.step();
+            loss_sum += loss.item()
         train_loss = loss_sum / len(train_loader)
 
-        model.eval(); val_loss_sum = 0.0
+        model.eval();
+        val_loss_sum = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 x = _normalize_batch(batch["x"].to(device), norm_mean, norm_std)
-                vloss, _ = model.loss(x, model(x)); val_loss_sum += vloss.item()
+                vloss, _ = model.loss(x, model(x));
+                val_loss_sum += vloss.item()
         val_loss = val_loss_sum / len(val_loader)
 
         val_energy, val_label_raw = _collect_energy_and_label(model, val_loader, device, norm_mean, norm_std)
         y_val = _binarize_label(val_label_raw.tolist())
-        thr, _ = _find_best_f1_threshold(y_val, val_energy)
-        val_pred = (val_energy > thr).astype(np.int32)
-        vm = _classification_metrics(y_val, val_pred); val_auc = _roc_auc_score(y_val, val_energy)
+        normal_scores = val_energy[y_val == 0]
+        abnormal_scores = val_energy[y_val == 1]
 
-        epoch_metrics.append({"epoch": epoch + 1, "train_loss": float(train_loss), "val_loss": float(val_loss), "val_auc": float(val_auc), "val_f1": float(vm["f1"]), "val_acc": float(vm["acc"]), "val_threshold": float(thr)})
-        print(f"[AD][Epoch {epoch + 1}/{args.ad_epochs}] train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_auc={val_auc:.4f} val_f1={vm['f1']:.4f} val_acc={vm['acc']:.4f} thr={thr:.6f}")
+        print("normal_scores.mean() =", normal_scores.mean())
+        print("abnormal_scores.mean() =", abnormal_scores.mean())
+        thr, _, direction = _find_best_f1_threshold(y_val, val_energy)
+        val_pred = (val_energy > thr).astype(np.int32) if direction == ">" else (val_energy < thr).astype(np.int32)
+        vm = _classification_metrics(y_val, val_pred);
+        val_auc = _roc_auc_score(y_val, val_energy)
+
+        epoch_metrics.append({"epoch": epoch + 1, "train_loss": float(train_loss), "val_loss": float(val_loss),
+                              "val_auc": float(val_auc), "val_f1": float(vm["f1"]), "val_acc": float(vm["acc"]),
+                              "val_threshold": float(thr), "val_direction": direction})
+        print(
+            f"[AD][Epoch {epoch + 1}/{args.ad_epochs}] train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_auc={val_auc:.4f} val_f1={vm['f1']:.4f} val_acc={vm['acc']:.4f} thr={thr:.6f} direction={direction}")
 
     val_energy, val_label_raw = _collect_energy_and_label(model, val_loader, device, norm_mean, norm_std)
     test_energy, test_label_raw = _collect_energy_and_label(model, test_loader, device, norm_mean, norm_std)
-    y_val = _binarize_label(val_label_raw.tolist()); y_test = _binarize_label(test_label_raw.tolist())
-    thr, best_val_f1 = _find_best_f1_threshold(y_val, val_energy)
-    test_pred = (test_energy > thr).astype(np.int32)
+    y_val = _binarize_label(val_label_raw.tolist());
+    y_test = _binarize_label(test_label_raw.tolist())
+    thr, best_val_f1, direction = _find_best_f1_threshold(y_val, val_energy)
+    test_pred = (test_energy > thr).astype(np.int32) if direction == ">" else (test_energy < thr).astype(np.int32)
     m = _classification_metrics(y_test, test_pred)
-    roc_auc = _roc_auc_score(y_test, test_energy); pr_auc = _pr_auc_score(y_test, test_energy)
+    roc_auc = _roc_auc_score(y_test, test_energy);
+    pr_auc = _pr_auc_score(y_test, test_energy)
 
-    run_name = f"AD-{datetime.now().strftime('%Y%m%d-%H%M%S')}"; run_dir = Path(getattr(args, "result_root", "results")) / run_name; run_dir.mkdir(parents=True, exist_ok=True)
-    summary = {"task": "AD", "run_name": run_name, "epoch_metrics": epoch_metrics, "best_f1_threshold_on_val": float(thr), "val_best_f1": float(best_val_f1), "test_metrics": {"auc": float(roc_auc), "pr_auc": float(pr_auc), "f1": float(m["f1"]), "precision": float(m["precision"]), "recall": float(m["recall"]), "accuracy": float(m["acc"])}}
+    run_name = f"AD-{datetime.now().strftime('%Y%m%d-%H%M%S')}";
+    run_dir = Path(getattr(args, "result_root", "results")) / run_name;
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary = {"task": "AD", "run_name": run_name, "epoch_metrics": epoch_metrics,
+               "best_f1_threshold_on_val": float(thr), "best_direction_on_val": direction,
+               "val_best_f1": float(best_val_f1),
+               "test_metrics": {"auc": float(roc_auc), "pr_auc": float(pr_auc), "f1": float(m["f1"]),
+                                "precision": float(m["precision"]), "recall": float(m["recall"]),
+                                "accuracy": float(m["acc"])}}
     (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     with (run_dir / "train_loss_curve.csv").open("w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f); w.writerow(["epoch", "train_loss", "val_loss", "val_auc", "val_f1", "val_acc", "val_threshold"])
+        w = csv.writer(f);
+        w.writerow(
+            ["epoch", "train_loss", "val_loss", "val_auc", "val_f1", "val_acc", "val_threshold", "val_direction"])
         for row in epoch_metrics:
-            w.writerow([row["epoch"], row["train_loss"], row["val_loss"], row["val_auc"], row["val_f1"], row["val_acc"], row["val_threshold"]])
+            w.writerow([row["epoch"], row["train_loss"], row["val_loss"], row["val_auc"], row["val_f1"], row["val_acc"],
+                        row["val_threshold"], row["val_direction"]])
     with (run_dir / "val_scores_labels.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["index", "energy", "label_raw", "label_bin"])
@@ -238,11 +280,14 @@ def run_ad(args, device):
     with (run_dir / "test_scores_labels_pred.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["index", "energy", "label_raw", "label_bin", "pred_bin"])
-        for i, (e, raw, b, p) in enumerate(zip(test_energy.tolist(), test_label_raw.tolist(), y_test.tolist(), test_pred.tolist())):
+        for i, (e, raw, b, p) in enumerate(
+                zip(test_energy.tolist(), test_label_raw.tolist(), y_test.tolist(), test_pred.tolist())):
             w.writerow([i, e, raw, b, p])
 
-    print(f"[AD] val samples={len(y_val)}, best_f1_threshold={thr:.6f}, val_best_f1={best_val_f1:.4f}")
-    print(f"[AD] test metrics: AUC={roc_auc:.4f}, PR-AUC={pr_auc:.4f}, F1={m['f1']:.4f}, Precision={m['precision']:.4f}, Recall={m['recall']:.4f}")
+    print(
+        f"[AD] val samples={len(y_val)}, best_f1_threshold={thr:.6f}, direction={direction}, val_best_f1={best_val_f1:.4f}")
+    print(
+        f"[AD] test metrics: AUC={roc_auc:.4f}, PR-AUC={pr_auc:.4f}, F1={m['f1']:.4f}, Precision={m['precision']:.4f}, Recall={m['recall']:.4f}")
     print(f"[AD][Save] 本次训练结果已保存到: {run_dir}")
 
 
@@ -253,7 +298,7 @@ if __name__ == "__main__":
     parser.add_argument("--ad_num_workers", type=int, default=4)
     parser.add_argument("--ad_epochs", type=int, default=20)
     parser.add_argument("--ad_lr", type=float, default=1e-3)
-    parser.add_argument("--ad_latent_dim", type=int, default=64)
+    parser.add_argument("--ad_latent_dim", type=int, default=8)
     parser.add_argument("--ad_n_gmm", type=int, default=4)
     parser.add_argument("--ad_val_ratio", type=float, default=0.2)
     parser.add_argument("--result_root", type=str, default="results")
