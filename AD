@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -12,6 +13,16 @@ from torch.utils.data import DataLoader, Dataset
 from dagmm import DAGMM
 
 FEATURES = ["volt", "current", "soc", "max_single_volt", "min_single_volt", "max_temp", "min_temp", "timestamp"]
+
+torch.use_deterministic_algorithms(False)
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = True
+
+def _seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 class BatteryPklDataset(Dataset):
@@ -125,10 +136,12 @@ def build_ad_dataloaders(data_root: str, batch_size: int = 256, num_workers: int
     val_idx, test_idx = _stratified_split_indices(labels, val_ratio=val_ratio, seed=seed)
     val_ds = torch.utils.data.Subset(test_all, val_idx)
     test_ds = torch.utils.data.Subset(test_all, test_idx)
+    g = torch.Generator().manual_seed(seed)
+
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn),
-        DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn),
-        DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn),
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn, worker_init_fn=_seed_worker, generator=g),
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn, worker_init_fn=_seed_worker, generator=g),
+        DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn, worker_init_fn=_seed_worker, generator=g),
     )
 
 
@@ -194,9 +207,23 @@ def _find_best_f1_threshold(y_true_bin: np.ndarray, scores: np.ndarray) -> Tuple
 
 
 def run_ad(args, device):
-    train_loader, val_loader, test_loader = build_ad_dataloaders(args.ad_data_root, args.ad_batch_size,
-                                                                 args.ad_num_workers, args.ad_val_ratio,
-                                                                 int(getattr(args, "seed", 2023)))
+    seed = int(getattr(args, "seed", 2023))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    train_loader, val_loader, test_loader = build_ad_dataloaders(
+        args.ad_data_root,
+        args.ad_batch_size,
+        args.ad_num_workers,
+        args.ad_val_ratio,
+        seed,
+    )
     norm_mean, norm_std = _compute_feature_norm_stats(train_loader, device)
     model = DAGMM(input_dim=128 * len(FEATURES), latent_dim=args.ad_latent_dim, n_gmm=args.ad_n_gmm, seq_len=128,
                   feature_dim=len(FEATURES)).to(device)
