@@ -19,6 +19,7 @@ class DAGMM(nn.Module):
         lstm_layers: int = 2,
         estimation_hidden_dim: int = 32,
         dropout: float = 0.1,
+        cnn_hidden_dim: int = 32,
         eps: float = 1e-12,
     ):
         super().__init__()
@@ -28,6 +29,14 @@ class DAGMM(nn.Module):
         self.seq_len = seq_len
         self.feature_dim = feature_dim
         self.eps = eps
+
+        self.feature_extractor = nn.Sequential(
+            nn.Conv1d(feature_dim, cnn_hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(cnn_hidden_dim, feature_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+
 
         self.encoder = nn.LSTM(
             input_size=feature_dim,
@@ -53,14 +62,15 @@ class DAGMM(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        _, (h_n, c_n) = self.encoder(x)
+        x_feat = self.feature_extractor(x.transpose(1, 2)).transpose(1, 2)
+        _, (h_n, c_n) = self.encoder(x_feat)
         z_c = h_n[-1]
 
         decoder_input = z_c.unsqueeze(1).repeat(1, self.seq_len, 1)
         dec_out, _ = self.decoder(decoder_input, (h_n, c_n))
         x_hat = self.output_layer(dec_out)
 
-        rec_error = ((x - x_hat) ** 2).mean(dim=(1, 2), keepdim=True)
+        rec_error = ((x_feat - x_hat) ** 2).mean(dim=(1, 2), keepdim=True)
         rec_error = rec_error.view(-1, 1)
 
         z = torch.cat([z_c, rec_error], dim=1)
@@ -70,6 +80,7 @@ class DAGMM(nn.Module):
 
         return {
             "x_hat": x_hat,
+            "x_feat": x_feat,
             "z_c": z_c,
             "rec_error": rec_error,
             "z": z,
@@ -115,7 +126,7 @@ class DAGMM(nn.Module):
         lambda_energy: float = 0.1,
         lambda_cov: float = 0.005,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        rec_loss = F.mse_loss(outputs["x_hat"], x.detach())
+        rec_loss = F.mse_loss(outputs["x_hat"], outputs["x_feat"].detach())
         energy_loss = outputs["energy"].mean()
         cov_diag = torch.diagonal(outputs["cov"], dim1=1, dim2=2)
         cov_loss = torch.mean(1.0 / cov_diag.clamp_min(self.eps))
