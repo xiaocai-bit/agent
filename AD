@@ -14,10 +14,6 @@ from dagmm import DAGMM
 
 FEATURES = ["volt", "current", "soc", "max_single_volt", "min_single_volt", "max_temp", "min_temp", "timestamp"]
 
-torch.use_deterministic_algorithms(False)
-torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.benchmark = True
-
 def _seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
     random.seed(worker_seed)
@@ -205,17 +201,22 @@ def _find_best_f1_threshold(y_true_bin: np.ndarray, scores: np.ndarray) -> Tuple
 
     return best_thr, best_f1, best_direction
 
-
-def run_ad(args, device):
-    seed = int(getattr(args, "seed", 2023))
+def configure_ad_randomness(seed: int):
+    """Set AD randomness controls: RNG seeds + non-strict backend behavior."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+
+    torch.use_deterministic_algorithms(False)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+def run_ad(args, device):
+    seed = int(getattr(args, "seed", 2026))
+    configure_ad_randomness(seed)
+
 
     train_loader, val_loader, test_loader = build_ad_dataloaders(
         args.ad_data_root,
@@ -225,8 +226,15 @@ def run_ad(args, device):
         seed,
     )
     norm_mean, norm_std = _compute_feature_norm_stats(train_loader, device)
-    model = DAGMM(input_dim=128 * len(FEATURES), latent_dim=args.ad_latent_dim, n_gmm=args.ad_n_gmm, seq_len=128,
-                  feature_dim=len(FEATURES)).to(device)
+
+    model = DAGMM(
+        input_dim=128 * len(FEATURES),
+        latent_dim=args.ad_latent_dim,
+        n_gmm=args.ad_n_gmm,
+        seq_len=128,
+        feature_dim=len(FEATURES),
+        cnn_hidden_dim=args.ad_cnn_hidden_dim,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.ad_lr)
 
     epoch_metrics = []
@@ -326,6 +334,7 @@ if __name__ == "__main__":
     parser.add_argument("--ad_epochs", type=int, default=20)
     parser.add_argument("--ad_lr", type=float, default=1e-3)
     parser.add_argument("--ad_latent_dim", type=int, default=8)
+    parser.add_argument("--ad_cnn_hidden_dim", type=int, default=32)
     parser.add_argument("--ad_n_gmm", type=int, default=4)
     parser.add_argument("--ad_val_ratio", type=float, default=0.2)
     parser.add_argument("--result_root", type=str, default="results")
