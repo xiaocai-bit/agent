@@ -148,7 +148,7 @@ class TSLLMModel(nn.Module):
             nn.Linear(out_dim // 2, 1)
         ).float()
 
-    def forward(self, features, cycle_id, return_latent=False):
+    def encode_cycle(self, features, cycle_id):
         ts_tokens = self.feature_tokenizer(features)
 
         cycle_tokens = cycle_id.unsqueeze(1).expand(-1, self.num_tokens, -1)
@@ -164,13 +164,121 @@ class TSLLMModel(nn.Module):
         attn_score = self.pool_attn(h)
         attn_weight = torch.softmax(attn_score, dim=1)
         pooled = (h * attn_weight).sum(dim=1)
+        return pooled
 
-        pooled = pooled.to(dtype=next(self.head.parameters()).dtype)
-        yhat = self.head(pooled).squeeze(-1)
+    def predict_from_latent(self, latent):
+        latent = latent.to(dtype=next(self.head.parameters()).dtype)
+        return self.head(latent).squeeze(-1)
+
+    def forward(self, features, cycle_id, return_latent=False):
+        pooled = self.encode_cycle(features, cycle_id)
+        yhat = self.predict_from_latent(pooled)
 
         if return_latent:
             return yhat, pooled
         return yhat
+
+
+class CrossTemporalSOHModel(nn.Module):
+    """Current-state and historical-degradation SOH estimator.
+
+    The current branch encodes the handcrafted feature vector of cycle ``t`` as
+    ``z_t``.  The historical branch reuses the same cycle encoder on the latest
+    ``K`` cycles, aggregates their latent states with a Transformer, and learns
+    a generator ``g(z_h)`` that reconstructs the current health-state
+    representation.  This implements the cross-temporal constraint
+    ``||z_t - g(z_h)||^2`` without claiming access to raw fine-scale signals.
+    """
+
+    def __init__(self, backbone, history_len=10, num_layers=1, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.backbone = backbone
+        self.history_len = history_len
+        hidden_size = backbone.llm_enc.hidden_size
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 2,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        self.history_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.history_head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1)
+        ).float()
+
+        self.generator = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size)
+        ).float()
+
+    @property
+    def llm_enc(self):
+        return self.backbone.llm_enc
+
+    def encode_history(self, history_features, history_cycle_id):
+        B, K, D = history_features.shape
+        flat_features = history_features.reshape(B * K, D)
+        flat_cycle = history_cycle_id.reshape(B * K, -1)
+
+        flat_latent = self.backbone.encode_cycle(flat_features, flat_cycle)
+        history_latent = flat_latent.reshape(B, K, -1)
+        history_latent = history_latent.to(dtype=next(self.history_encoder.parameters()).dtype)
+
+        encoded = self.history_encoder(history_latent)
+        return encoded[:, -1, :]
+
+    def forward(
+            self,
+            features,
+            cycle_id,
+            history_features=None,
+            history_cycle_id=None,
+            return_latent=False,
+            return_cross_temporal=False
+    ):
+        y_current, z_current = self.backbone(
+            features,
+            cycle_id,
+            return_latent=True
+        )
+
+        if history_features is None or history_cycle_id is None:
+            if return_latent:
+                return y_current, z_current
+            return y_current
+
+        z_history = self.encode_history(history_features, history_cycle_id)
+        z_history = z_history.to(dtype=next(self.history_head.parameters()).dtype)
+        y_history = self.history_head(z_history).squeeze(-1)
+        z_hat_current = self.generator(z_history)
+
+        if return_cross_temporal:
+            return {
+                "pred_current": y_current,
+                "pred_history": y_history,
+                "z_current": z_current,
+                "z_history": z_history,
+                "z_hat_current": z_hat_current
+            }
+
+        if return_latent:
+            return y_current, z_current
+        return y_current
 
 
 class PhysicsNet(nn.Module):
