@@ -7,7 +7,58 @@ def _safe_mape(y_true, y_pred, eps=1e-8):
     return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
 
 
+def _metrics(y_true, y_pred):
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    mape = _safe_mape(y_true, y_pred)
+
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    r2 = float(1.0 - ss_res / (ss_tot + 1e-8))
+
+    return {
+        "MAE": mae,
+        "MAPE": mape,
+        "RMSE": rmse,
+        "R2": r2
+    }
+
+
+def _predict(model, batch, device):
+    if len(batch) == 5:
+        x, y, cycle_id, history_x, history_cycle_id = batch
+        x = x.float().to(device)
+        y = y.float().to(device)
+        cycle_id = cycle_id.float().to(device)
+        history_x = history_x.float().to(device)
+        history_cycle_id = history_cycle_id.float().to(device)
+        pred = model(
+            x,
+            cycle_id,
+            history_features=history_x,
+            history_cycle_id=history_cycle_id
+        )
+    else:
+        x, y, cycle_id = batch
+        x = x.float().to(device)
+        y = y.float().to(device)
+        cycle_id = cycle_id.float().to(device)
+        pred = model(x, cycle_id)
+
+    return pred.unsqueeze(-1), y
+
+
 def evaluate(model, device, loader, loss_fn):
+    avg_loss, metrics, _, _ = evaluate_with_outputs(
+        model=model,
+        device=device,
+        loader=loader,
+        loss_fn=loss_fn
+    )
+    return avg_loss, metrics
+
+
+def evaluate_with_outputs(model, device, loader, loss_fn):
     model.eval()
 
     loss_sum = 0.0
@@ -16,15 +67,7 @@ def evaluate(model, device, loader, loss_fn):
 
     with torch.no_grad():
         for batch in loader:
-            x, y, cycle_id = batch
-
-            x = x.float().to(device)
-            y = y.float().to(device)
-            cycle_id = cycle_id.float().to(device)
-
-            pred = model(x, cycle_id)
-            pred = pred.unsqueeze(-1)
-
+            pred, y = _predict(model, batch, device)
             loss = loss_fn(pred, y)
             loss_sum += loss.item()
 
@@ -36,19 +79,6 @@ def evaluate(model, device, loader, loss_fn):
     y_pred = torch.cat(preds, dim=0).numpy().reshape(-1)
     y_true = torch.cat(trues, dim=0).numpy().reshape(-1)
 
-    mae = float(np.mean(np.abs(y_true - y_pred)))
-    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-    mape = _safe_mape(y_true, y_pred)
+    metrics = _metrics(y_true, y_pred)
 
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
-    r2 = float(1.0 - ss_res / (ss_tot + 1e-8))
-
-    metrics = {
-        "MAE": mae,
-        "MAPE": mape,
-        "RMSE": rmse,
-        "R2": r2
-    }
-
-    return avg_loss, metrics
+    return avg_loss, metrics, y_pred, y_true
