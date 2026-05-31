@@ -11,11 +11,80 @@ from MIT_loader import MITDdataset
 
 from models import (
     TSLLMModel,
+    CrossTemporalSOHModel,
     PhysicsNet
 )
 
 from train_utils import evaluate, evaluate_with_outputs
 from prompts import build_dataloaders
+
+
+class HistoricalCycleDataset(torch.utils.data.Dataset):
+    """Adds a causal K-cycle history window to a cycle-level TensorDataset.
+
+    Each base sample is still a 67-dimensional current-cycle representation.
+    The added history tensors provide ``X_{t-K+1:t}`` and their normalized cycle
+    coordinates so the model can learn a historical degradation representation.
+    """
+
+    def __init__(self, base_dataset, history_window):
+        self.base_dataset = base_dataset
+        self.history_window = int(history_window)
+
+        if hasattr(base_dataset, "tensors") and len(base_dataset.tensors) >= 3:
+            features, _, cycle_id = base_dataset.tensors[:3]
+        else:
+            samples = [base_dataset[i] for i in range(len(base_dataset))]
+            if not samples or len(samples[0]) < 3:
+                raise TypeError(
+                    "Cross-temporal SOH training expects samples with "
+                    "(features, labels, cycle_id)."
+                )
+            features = torch.stack([sample[0] for sample in samples], dim=0)
+            cycle_id = torch.stack([sample[2] for sample in samples], dim=0)
+        cycles = cycle_id.reshape(cycle_id.size(0), -1)[:, 0]
+        sorted_indices = torch.argsort(cycles, stable=True)
+
+        history_indices = torch.empty(
+            (len(base_dataset), self.history_window),
+            dtype=torch.long
+        )
+
+        for sorted_pos, sample_idx in enumerate(sorted_indices.tolist()):
+            start = max(0, sorted_pos - self.history_window + 1)
+            window = sorted_indices[start:sorted_pos + 1]
+            if window.numel() < self.history_window:
+                pad = window[0].repeat(self.history_window - window.numel())
+                window = torch.cat([pad, window], dim=0)
+            history_indices[sample_idx] = window
+
+        self.history_features = features[history_indices].clone()
+        self.history_cycle_id = cycle_id[history_indices].clone()
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        x, y, cycle_id = self.base_dataset[idx]
+        return (
+            x,
+            y,
+            cycle_id,
+            self.history_features[idx],
+            self.history_cycle_id[idx]
+        )
+
+
+def add_history_to_loader(loader, history_window):
+    history_dataset = HistoricalCycleDataset(loader.dataset, history_window)
+    return torch.utils.data.DataLoader(
+        history_dataset,
+        batch_size=loader.batch_size,
+        shuffle=isinstance(loader.sampler, torch.utils.data.RandomSampler),
+        drop_last=loader.drop_last,
+        num_workers=getattr(loader, "num_workers", 0),
+        pin_memory=getattr(loader, "pin_memory", False)
+    )
 
 
 # =========================================================
@@ -58,6 +127,14 @@ SOH_CONFIG = {
     "physics_lambda": 0.1,
 
     "monotonic_lambda": 0.005,
+
+    "use_cross_temporal": True,
+
+    "history_window": 10,
+
+    "history_lambda": 0.5,
+
+    "cross_temporal_lambda": 0.05,
 
     # =====================================================
     # misc
@@ -125,11 +202,25 @@ def run_soh(args, device):
         data_dict
     )
 
+    if cfg.use_cross_temporal:
+        train_loader = add_history_to_loader(
+            train_loader,
+            cfg.history_window
+        )
+        val_loader = add_history_to_loader(
+            val_loader,
+            cfg.history_window
+        )
+        test_loader = add_history_to_loader(
+            test_loader,
+            cfg.history_window
+        )
+
     # =====================================================
     # model
     # latent token PINN backbone
     # =====================================================
-    model = TSLLMModel(
+    backbone = TSLLMModel(
 
         input_dim=67,
 
@@ -145,7 +236,16 @@ def run_soh(args, device):
 
         llm_dtype="bf16"
 
-    ).to(device)
+    )
+
+    if cfg.use_cross_temporal:
+        model = CrossTemporalSOHModel(
+            backbone=backbone,
+            history_len=cfg.history_window,
+            dropout=cfg.dropout
+        ).to(device)
+    else:
+        model = backbone.to(device)
 
     # =====================================================
     # physics net
@@ -156,7 +256,10 @@ def run_soh(args, device):
 
     ).to(device)
 
-    print("\n[Model] TSLLMModel + PhysicsNet")
+    if cfg.use_cross_temporal:
+        print("\n[Model] TSLLMModel + CrossTemporalSOHModel + PhysicsNet")
+    else:
+        print("\n[Model] TSLLMModel + PhysicsNet")
 
     # =====================================================
     # optimizer
@@ -222,7 +325,14 @@ def run_soh(args, device):
             # =============================================
             # batch
             # =============================================
-            ts_x, y, cycle_id = batch
+            if len(batch) == 5:
+                ts_x, y, cycle_id, history_x, history_cycle_id = batch
+                history_x = history_x.float().to(device)
+                history_cycle = history_cycle_id.float().to(device)
+            else:
+                ts_x, y, cycle_id = batch
+                history_x = None
+                history_cycle = None
 
             ts_x = ts_x.float().to(device)
 
@@ -233,16 +343,31 @@ def run_soh(args, device):
             # =============================================
             # forward
             # =============================================
-            pred, latent_h = model(
+            if history_x is not None and cfg.use_cross_temporal:
+                outputs = model(
+                    ts_x,
+                    cycle_norm,
+                    history_features=history_x,
+                    history_cycle_id=history_cycle,
+                    return_cross_temporal=True
+                )
+                pred = outputs["pred_current"].unsqueeze(-1)
+                latent_h = outputs["z_current"]
+                pred_history = outputs["pred_history"].unsqueeze(-1)
+                z_hat_current = outputs["z_hat_current"]
+            else:
+                pred, latent_h = model(
 
-                ts_x,
+                    ts_x,
 
-                cycle_norm,
+                    cycle_norm,
 
-                return_latent=True
-            )
+                    return_latent=True
+                )
 
-            pred = pred.unsqueeze(-1)
+                pred = pred.unsqueeze(-1)
+                pred_history = None
+                z_hat_current = None
 
             # =============================================
             # data loss
@@ -298,11 +423,31 @@ def run_soh(args, device):
             ).mean()
 
             # =============================================
+            # cross-temporal losses
+            # =============================================
+            if pred_history is not None:
+                history_loss = loss_fn(
+                    pred_history,
+                    y
+                )
+                cross_temporal_loss = loss_fn(
+                    z_hat_current.float(),
+                    latent_h.float()
+                )
+            else:
+                history_loss = torch.zeros((), device=device)
+                cross_temporal_loss = torch.zeros((), device=device)
+
+            # =============================================
             # total loss
             # =============================================
             loss = (
 
                 data_loss
+
+                + cfg.history_lambda * history_loss
+
+                + cfg.cross_temporal_lambda * cross_temporal_loss
 
                 + cfg.physics_lambda * physics_loss
 
