@@ -1,3 +1,11 @@
+"""Model definitions for battery SOH estimation.
+
+This module intentionally keeps the four model classes as top-level siblings:
+LLMTokenEncoder, TSLLMModel, CrossTemporalSOHModel, and PhysicsNet.  Keeping
+them flat avoids partially registered modules and makes
+``from models import CrossTemporalSOHModel`` reliable.
+"""
+
 import torch
 from torch import nn
 
@@ -6,6 +14,14 @@ from transformers import AutoTokenizer
 
 from peft import LoraConfig
 from peft import get_peft_model
+
+
+__all__ = [
+    "LLMTokenEncoder",
+    "TSLLMModel",
+    "CrossTemporalSOHModel",
+    "PhysicsNet",
+]
 
 
 class LLMTokenEncoder(nn.Module):
@@ -133,6 +149,7 @@ class TSLLMModel(nn.Module):
         )
 
         out_dim = self.llm_enc.hidden_size
+        self.latent_dim = out_dim
 
         self.pool_attn = nn.Sequential(
             nn.Linear(out_dim, out_dim // 2),
@@ -195,6 +212,7 @@ class CrossTemporalSOHModel(nn.Module):
         self.backbone = backbone
         self.history_len = history_len
         hidden_size = backbone.llm_enc.hidden_size
+        self.latent_dim = hidden_size
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
